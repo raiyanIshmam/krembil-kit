@@ -2,6 +2,7 @@
 build
 twine
 bump2version
+pytest
 
 # Core dependencies (for reference)
 numpy

@@ -1,0 +1,68 @@
+GNN PIPELINE ARCHITECTURE REVAMP - STRATEGY AND CONTEXT
+
+1. PROJECT OBJECTIVE
+To methodically redesign an existing Graph Neural Network (GNN) pipeline
+used for seizure onset zone localization and seizure classification. The
+goal is to transition from a collection of entangled scripts to a
+structured, maintainable Python package over a multi-month to one-year
+timeline.
+
+2. CURRENT CHALLENGES
+- The existing codebase is difficult to navigate due to complex import
+  structures between preprocessing, graph generation, and training
+  scripts.
+- Data ingestion is highly variable, involving BIDS directories, EDF
+  files, EDF+C (continuous), and EDF+D (discontinuous) formats.
+- Task extraction logic varies significantly (e.g., separating
+  pre-ictal, ictal, and post-ictal periods versus isolating
+  non-stimulation periods for CM-DBS projects).
+
+3. PROPOSED SYSTEM ARCHITECTURE
+The new system will be built as a formal Python package. It will strictly
+enforce modularity, ensuring that components execute single
+responsibilities and communicate through standardized data structures.
+
+Module A: Data Ingestion and Preprocessing
+- Responsibility: Read raw files and convert them into a uniform
+  internal data structure.
+- Principle: The reading of a file (opening an EDF) must be strictly
+  separated from the extraction of specific segments (isolating a
+  seizure).
+
+Module B: Graph Generation
+- Responsibility: Construct the mathematical graph representation.
+- Sub-components:
+  - Adjacency Matrix Builder: Interchangeable logic for static
+    connections (e.g., structural MRI data) or dynamic connections
+    (e.g., EEG correlation/coherence).
+  - Node Feature Builder: Calculates node metrics (e.g., energy).
+  - Edge Feature Builder: Calculates edge metrics.
+  - Graph Assembler: Packages the matrices and features into a
+    finalized graph object.
+
+Module C: Model Training and Evaluation
+- Responsibility: Receive standardized graph objects and execute the
+  neural network layers, training loops, and performance scoring.
+
+4. INTEGRATION WITH KREMBIL-KIT
+To maintain separation of concerns, the general file-reading tools,
+format converters, and fundamental signal processing functions should be
+housed within the existing `krembil-kit` package. The core GNN pipeline
+will import `krembil-kit` to handle data ingestion, protecting the
+neural network code from changes in file formats.
+
+5. CONFIGURATION-DRIVEN LOGIC
+To avoid convoluted and fragile code, the system will not attempt to
+guess subjective data structures.
+- Factual Data: The system will automatically read standardized facts
+  (e.g., reading the 44-character reserved field in an EDF header to
+  identify EDF+C versus EDF+D).
+- Subjective Data: The system will rely on user-provided configuration
+  files (e.g., text or structured data files) to map dataset-specific
+  annotations to internal states. For example, a configuration file
+  will instruct the pipeline that the label "sz_start" corresponds to
+  "ictal", or provide specific start and end times for stimulation
+  periods.
+
+This approach ensures the core package remains simple, testable, and
+adaptable to future datasets.

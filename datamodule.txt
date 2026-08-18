@@ -1,0 +1,91 @@
+DATA INGESTION AND STANDARDIZATION STRATEGY
+
+1. MODULE OBJECTIVE
+The primary goal of the initial data ingestion step is to act as a
+universal translator. It reads raw clinical recording files from various
+sources and converts them into a standardized HDF5 format. Crucially,
+this step involves zero preprocessing; it is a direct, lossless
+conversion of the original numerical data, timestamps, and annotations.
+
+2. LONG-TERM BENEFITS OF EARLY STANDARDIZATION
+Converting multiple file formats to HDF5 without any processing provides
+immediate structural benefits that make downstream tasks significantly
+easier, regardless of the data's origin. It is my opinion that this
+approach prevents technical debt because:
+- Unified Interface: Downstream users and scripts (whether for plotting,
+  filtering, or machine learning) only need to know how to interact with
+  one file type (HDF5) rather than navigating the specific quirks of
+  EDF, EDF+C, or BIDS structures.
+- Memory Efficiency: HDF5 allows users to retrieve specific channels or
+  time segments instantly without loading entire massive files into the
+  system's memory, which is a major limitation of standard continuous
+  formats.
+- Universal Compatibility: HDF5 is natively supported across numerous
+  programming languages and analysis tools, allowing the entire
+  laboratory to use the data without specialized translation scripts.
+
+3. ARCHITECTURE AND EXTENSIBILITY
+The ingestion module will be designed to avoid convoluted code by
+strictly separating format-specific logic.
+- Central Dispatcher: A central routing function will look at the
+  incoming file extension.
+- Independent Readers: It will pass the file to an isolated reading
+  function built specifically for that format.
+Because these reading functions do not interact with one another, adding
+new data formats in the future simply requires writing one new isolated
+function and updating the central dispatcher, leaving the rest of the
+pipeline untouched.
+
+4. CURRENTLY SUPPORTED FORMATS AND HANDLING RULES
+- EDF+C (Continuous): The continuous numerical array, annotations, and
+  metadata are extracted and saved directly into the HDF5 structure.
+- BIDS Data (.eeg / BrainVision): The pipeline reads the three
+  associated files (the raw data, the header, and the marker files) and
+  consolidates them into the single HDF5 container.
+- EDF+D (Discontinuous): To avoid wasting memory and creating artificial
+  data, discontinuous files will not be zero-padded. Instead, the
+  reading function will treat gaps as hard boundaries. Each continuous
+  segment of the recording will be saved as an independent array within
+  the single HDF5 file (e.g., segment_1, segment_2), alongside their
+  precise starting timestamps. This perfectly preserves the original
+  data without introducing massive empty arrays.
+
+FUTURE INTEGRATION STRATEGY: SPIKE2 (.SMR / .SMRX) DATA
+
+1. CURRENT STATUS
+Support for Cambridge Electronic Design (CED) Spike2 (.smr / .smrx)
+recordings is intentionally deferred to prioritize the stability of the
+core pipeline for standard recording formats (EDF, EDF+C, EDF+D, and
+BrainVision).
+
+2. ARCHITECTURAL SAFETY
+Deferring this format carries zero risk of breaking the codebase in the
+future. Because the ingestion module uses an isolated reader structure,
+adding Spike2 support later will only require adding an independent
+reader function to the system, leaving the existing pipeline completely
+unaffected.
+
+3. IMPLEMENTATION PATHWAYS (FOR FUTURE PHASE)
+
+- Pathway 1: Native Library Integration
+  Once modern compatibility is independently verified, implement a
+  dedicated reader using official CED libraries (such as sonpy) or
+  open-source packages (such as neo). This reader will extract
+  continuous signals (such as local field potentials) and discrete event
+  timestamps into their respective standardized sections within the
+  single HDF5 container.
+
+- Pathway 2: MATLAB Export Workaround (Primary Fallback)
+  If direct library integration encounters dependency or compatibility
+  conflicts, establish a lab protocol where Spike2 files are exported
+  from the native recording software as MATLAB files (.mat). The
+  ingestion module will contain a standard reader for MATLAB files,
+  which avoids legacy dependency conflicts and integrates smoothly with
+  modern computing environments.
+
+- Pathway 3: Isolated Subprocess Execution (Secondary Fallback)
+  If native software access is unavailable and legacy dependencies are
+  required, execute the conversion through an isolated background
+  environment. A minimal conversion script will run in the background
+  to convert the file to HDF5 and return the clean data directly to
+  the main pipeline.

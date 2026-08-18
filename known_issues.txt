@@ -1,0 +1,31 @@
+KNOWN ISSUES AND DEFERRED WORK
+
+1. EDF+D MEMORY WITH MANY LARGE SEGMENTS
+   The discontinuous reader builds a list of all segments in memory
+   before passing them to the schema writer. If a file has many
+   large segments (e.g., 100 segments × 200 MB each), peak memory
+   equals the total data size. Fix: write each segment to HDF5
+   immediately after reading, then discard. Requires restructuring
+   the reader-writer interface for the discontinuous case.
+   Priority: Low (current test files work fine; only affects
+   multi-GB discontinuous recordings with many segments).
+
+2. BRAINVISION READER — VERIFIED
+   The BrainVision reader passed all tests (signals + events)
+   with a real 127-channel recording. No longer an open issue.
+
+3. PLAIN EDF READER UNTESTED
+   The plain EDF reader (read_edf) is untested with a real file.
+   Code path is nearly identical to read_edf_plus_c minus
+   annotations. Low risk but unverified.
+
+4. NO ERROR HANDLING TESTS
+   No tests for malformed inputs: truncated files, bad headers,
+   missing annotation channels, unsupported extensions. The code
+   raises errors but this behavior is not formally tested.
+
+5. CENTRALIZED HDF5 LOADER NOT IMPLEMENTED
+   versioning.txt specifies a version-aware loading utility that
+   checks schema_version and handles future migrations. Only the
+   writer exists. The loader is needed before downstream modules
+   can consume HDF5 files through a stable interface.
