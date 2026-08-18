@@ -276,6 +276,59 @@ class TestRealEDFD:
         assert len(ref_files) > 0
         verify_segments(h5, ref_files)
 
+    def test_events(self, tmp_path):
+        """
+        Verify annotations by comparing against reference segments.
+        Each reference segment's annotations are offset by the
+        corresponding HDF5 segment start time to get absolute times.
+        Every reference annotation must have a match in the HDF5.
+        """
+        require_file(EDFD_FILE)
+        require_dir(EDFD_REF_DIR)
+
+        h5 = str(tmp_path / "out.h5")
+        ingest(str(EDFD_FILE), output_path=h5)
+
+        ref_files = sorted(EDFD_REF_DIR.glob("*.edf"), key=lambda p: p.name)
+
+        with h5py.File(h5, "r") as f:
+            h5_onsets = f["events"]["onsets"][:]
+            h5_descs = [
+                d.decode() if isinstance(d, bytes) else d
+                for d in f["events"]["descriptions"][:]
+            ]
+
+            # Collect reference annotations with absolute times
+            n_segments = f["signals"].attrs["n_segments"]
+            seg_starts = [
+                f["signals"][f"segment_{i}"].attrs["start_time_seconds"]
+                for i in range(n_segments)
+            ]
+
+        ref_annotations = []
+        for seg_idx, ref_file in enumerate(ref_files):
+            if seg_idx >= len(seg_starts):
+                break
+            ref_raw = mne.io.read_raw_edf(str(ref_file), preload=False, verbose=False)
+            annot = ref_raw.annotations
+            if annot is None or len(annot) == 0:
+                continue
+            for onset, desc in zip(annot.onset, annot.description):
+                ref_annotations.append((seg_starts[seg_idx] + onset, desc))
+
+        assert len(ref_annotations) > 0, "No reference annotations found"
+
+        # Every reference annotation must match one in the HDF5
+        tolerance = 0.5
+        for ref_onset, ref_desc in ref_annotations:
+            matched = any(
+                h5_descs[i] == ref_desc and abs(h5_onsets[i] - ref_onset) < tolerance
+                for i in range(len(h5_onsets))
+            )
+            assert matched, (
+                f"Annotation not found in HDF5: t={ref_onset:.1f}s \"{ref_desc}\""
+            )
+
 
 # ────────────────────────────────────────────────────────────────────
 # Real data: BrainVision

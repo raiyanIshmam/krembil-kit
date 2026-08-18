@@ -95,13 +95,16 @@ def read_edf_plus_d(file_path: str) -> Dict[str, Any]:
     from each data record and detecting gaps. Each segment is then
     read from disk individually — memory usage is bounded by the
     largest single segment.
+
+    Annotations are parsed directly from TAL bytes (not from MNE)
+    because MNE drops annotations outside its concatenated timeline.
     """
     file_path = str(Path(file_path).resolve())
     raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
 
     sfreq = raw.info["sfreq"]
     record_duration, n_records = _read_record_params(file_path)
-    tal_onsets = _parse_tal_onsets(file_path)
+    tal_onsets, tal_annotations = _parse_tals(file_path)
     boundaries = _segment_boundaries(tal_onsets, record_duration, sfreq, n_records)
 
     segments = []
@@ -110,12 +113,22 @@ def read_edf_plus_d(file_path: str) -> Dict[str, Any]:
         segments.append(raw.get_data(start=start_samp, stop=stop_samp))
         segment_start_times.append(onset_time)
 
+    # Build events from TAL annotations (excluding empty time-keeping ones)
+    if tal_annotations:
+        events = {
+            "onsets": [a["onset"] for a in tal_annotations],
+            "durations": [a["duration"] for a in tal_annotations],
+            "descriptions": [a["description"] for a in tal_annotations],
+        }
+    else:
+        events = None
+
     return {
         "signals": segments,
         "channel_names": raw.ch_names,
         "channel_units": _channel_units(raw),
         "sampling_rates": _uniform_rates(raw),
-        "events": _annotations_to_events(raw),
+        "events": events,
         "metadata": _build_metadata(raw, "EDF+D", file_path),
         "discontinuous": True,
         "segment_start_times": segment_start_times,
@@ -148,27 +161,31 @@ def _read_record_params(file_path: str) -> Tuple[float, int]:
 def _parse_tal_onsets(file_path: str) -> List[float]:
     """
     Extract the onset time from the first TAL in each data record.
+    Wrapper around _parse_tals that returns only the record onsets.
+    """
+    onsets, _ = _parse_tals(file_path)
+    return onsets
 
-    In EDF+, the last signal in each data record is the annotation
-    channel. Each annotation channel starts with a TAL whose onset
-    is the absolute time of that data record:
 
-        +<seconds>\x14(\x14)\x00...
+def _parse_tals(file_path: str):
+    """
+    Parse all TAL content from every data record's annotation channel.
 
-    This function reads only the annotation bytes — signal data is
-    never loaded into memory.
+    Returns
+    -------
+    record_onsets : list of float
+        The time-keeping onset from the first TAL in each record.
+    annotations : list of dict
+        Each dict has keys 'onset' (float), 'duration' (float),
+        'description' (str). Collected from all non-time-keeping
+        TALs across all records.
     """
     with open(file_path, "rb") as fh:
-        # Read the number of signals from the fixed header.
         fh.seek(252)
         n_signals = int(fh.read(4).decode("ascii").strip())
 
-        # Read the fixed header size (256 + 256 * n_signals bytes).
         header_size = 256 + 256 * n_signals
 
-        # Read per-signal "number of samples per record" (last field
-        # in the signal headers, 8 bytes each, starting at offset
-        # 256 + 216*n_signals).
         fh.seek(256 + 216 * n_signals)
         samples_per_record = []
         for _ in range(n_signals):
@@ -176,8 +193,6 @@ def _parse_tal_onsets(file_path: str) -> List[float]:
                 int(fh.read(8).decode("ascii").strip())
             )
 
-        # The annotation signal is the last one whose label contains
-        # "Annotation" (EDF+ convention). Find it by reading labels.
         fh.seek(256)
         labels = []
         for _ in range(n_signals):
@@ -188,21 +203,17 @@ def _parse_tal_onsets(file_path: str) -> List[float]:
             if "annotation" in label.lower():
                 annot_idx = i
         if annot_idx is None:
-            return []
+            return [], []
 
-        # Compute byte sizes per record.
-        # Each sample is 2 bytes (16-bit integer).
         signal_sizes = [s * 2 for s in samples_per_record]
         record_size = sum(signal_sizes)
         annot_offset_in_record = sum(signal_sizes[:annot_idx])
         annot_bytes = signal_sizes[annot_idx]
 
-        # Read record duration and count.
-        record_duration, n_records = _read_record_params(file_path)
+        _, n_records = _read_record_params(file_path)
 
-        # Parse onset from each record's annotation channel.
-        onsets = []
-        tal_onset_pattern = re.compile(rb"\+?(-?\d+\.?\d*)\x14")
+        record_onsets = []
+        annotations = []
 
         fh.seek(header_size)
         for _ in range(n_records):
@@ -211,11 +222,54 @@ def _parse_tal_onsets(file_path: str) -> List[float]:
             annot_data = fh.read(annot_bytes)
             fh.seek(record_start + record_size)
 
-            match = tal_onset_pattern.match(annot_data)
-            if match:
-                onsets.append(float(match.group(1)))
+            # Split into individual TALs (separated by \x00)
+            tals = annot_data.split(b"\x00")
 
-    return onsets
+            for tal_idx, tal in enumerate(tals):
+                if not tal or tal == b"\x00":
+                    continue
+
+                # Parse TAL: +<onset>(\x15<duration>)?\x14(<text>\x14)*
+                # Split on \x14 to get [onset_part, text1, text2, ...]
+                parts = tal.split(b"\x14")
+                if not parts or not parts[0]:
+                    continue
+
+                onset_part = parts[0]
+
+                # Extract onset time and optional duration
+                if b"\x15" in onset_part:
+                    time_str, dur_str = onset_part.split(b"\x15", 1)
+                    dur = float(dur_str) if dur_str else 0.0
+                else:
+                    time_str = onset_part
+                    dur = 0.0
+
+                # Parse onset time
+                try:
+                    onset_time = float(time_str)
+                except ValueError:
+                    continue
+
+                # First TAL in the record is time-keeping
+                if tal_idx == 0:
+                    record_onsets.append(onset_time)
+
+                # Extract annotation text (parts after onset, skip empties)
+                texts = [
+                    p.decode("utf-8", errors="replace")
+                    for p in parts[1:]
+                    if p
+                ]
+
+                for text in texts:
+                    annotations.append({
+                        "onset": onset_time,
+                        "duration": dur,
+                        "description": text,
+                    })
+
+    return record_onsets, annotations
 
 
 def _segment_boundaries(
