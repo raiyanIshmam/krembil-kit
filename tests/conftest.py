@@ -91,13 +91,20 @@ def create_synthetic_edf(n_channels=3, duration_sec=5, sfreq=256,
     return str(file_path), data, channel_names, sfreq
 
 
-def create_synthetic_edfd(n_channels=3, sfreq=256):
+def create_synthetic_edfd(n_channels=3, sfreq=256, annotations=None):
     """
     Create a synthetic EDF+D file with known gaps.
 
     Creates 3 segments: 2 seconds, gap, 2 seconds, gap, 1 second.
+
+    Parameters
+    ----------
+    annotations : list of (float, float, str), optional
+        Annotations as (absolute_onset, duration, description).
+        These are written into the TAL of the appropriate data record.
+
     Returns (file_path, segments_data, segment_start_times,
-             channel_names, sfreq).
+             channel_names, sfreq, annotations).
     """
     tmp_dir = tempfile.mkdtemp()
     file_path = Path(tmp_dir) / "synthetic_d.edf"
@@ -130,15 +137,15 @@ def create_synthetic_edfd(n_channels=3, sfreq=256):
     # Write EDF+D manually using raw bytes (no library writes EDF+D)
     _write_edfd_bytes(
         str(file_path), segments_data, segment_start_times,
-        channel_names, sfreq
+        channel_names, sfreq, annotations
     )
 
     return (str(file_path), segments_data, segment_start_times,
-            channel_names, sfreq)
+            channel_names, sfreq, annotations)
 
 
 def _write_edfd_bytes(file_path, segments, start_times,
-                      channel_names, sfreq):
+                      channel_names, sfreq, annotations=None):
     """
     Write a minimal EDF+D file from raw bytes.
 
@@ -146,6 +153,9 @@ def _write_edfd_bytes(file_path, segments, start_times,
     - Fixed header (256 bytes)
     - Signal headers (256 * n_signals bytes)
     - Data records with TAL annotation channel
+
+    Annotations are placed in the TAL of the data record whose
+    time range contains the annotation onset.
     """
     n_channels = len(channel_names)
     n_signals = n_channels + 1  # +1 for EDF Annotations signal
@@ -162,6 +172,22 @@ def _write_edfd_bytes(file_path, segments, start_times,
         n_recs = seg.shape[1] // samples_per_record
         records_per_segment.append(n_recs)
         total_records += n_recs
+
+    # Build a mapping of record index → list of annotations for that record
+    annot_by_record = {}
+    if annotations:
+        record_idx = 0
+        for seg_idx, (seg_start, seg) in enumerate(zip(start_times, segments)):
+            n_recs = records_per_segment[seg_idx]
+            for rec in range(n_recs):
+                rec_onset = seg_start + rec * record_duration
+                rec_end = rec_onset + record_duration
+                for onset, dur, desc in annotations:
+                    if rec_onset <= onset < rec_end:
+                        annot_by_record.setdefault(record_idx + rec, []).append(
+                            (onset, dur, desc)
+                        )
+            record_idx += n_recs
 
     # Physical range for signals
     phys_min = -500.0
@@ -237,6 +263,7 @@ def _write_edfd_bytes(file_path, segments, start_times,
 
         # Write data records
         scale = (phys_max - phys_min) / (dig_max - dig_min)
+        global_rec = 0
 
         for seg_idx, seg in enumerate(segments):
             n_recs = records_per_segment[seg_idx]
@@ -255,11 +282,23 @@ def _write_edfd_bytes(file_path, segments, start_times,
                     ).astype(np.int16)
                     f.write(digital.tobytes())
 
-                # Write annotation channel (TAL with onset time)
+                # Write annotation channel
                 onset_time = seg_start + rec * record_duration
-                tal = f"+{onset_time}\x14\x14\x00"
-                tal_bytes = tal.encode("ascii")
-                # Pad to full annotation channel size
                 annot_byte_size = annot_samples_per_record * 2
+
+                # Time-keeping TAL
+                tal_content = f"+{onset_time}\x14\x14\x00"
+
+                # Event TALs for this record
+                if global_rec in annot_by_record:
+                    for evt_onset, evt_dur, evt_desc in annot_by_record[global_rec]:
+                        if evt_dur > 0:
+                            tal_content += f"+{evt_onset}\x15{evt_dur}\x14{evt_desc}\x14\x00"
+                        else:
+                            tal_content += f"+{evt_onset}\x14{evt_desc}\x14\x00"
+
+                tal_bytes = tal_content.encode("ascii")
                 padded = tal_bytes + b"\x00" * (annot_byte_size - len(tal_bytes))
                 f.write(padded)
+
+                global_rec += 1

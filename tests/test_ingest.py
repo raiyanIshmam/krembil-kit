@@ -168,20 +168,20 @@ class TestSyntheticEDFC:
 class TestSyntheticEDFD:
 
     def test_structure(self, tmp_path):
-        path, _, _, ch_names, sfreq = create_synthetic_edfd()
+        path, _, _, ch_names, sfreq, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         verify_structure(h5, ch_names, sfreq, expect_discontinuous=True)
 
     def test_segment_count(self, tmp_path):
-        path, segments, _, _, _ = create_synthetic_edfd()
+        path, segments, _, _, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         with h5py.File(h5, "r") as f:
             assert f["signals"].attrs["n_segments"] == len(segments)
 
     def test_segment_start_times(self, tmp_path):
-        path, _, start_times, _, _ = create_synthetic_edfd()
+        path, _, start_times, _, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         with h5py.File(h5, "r") as f:
@@ -190,7 +190,7 @@ class TestSyntheticEDFD:
                 assert abs(actual - expected) < 0.01
 
     def test_signals(self, tmp_path):
-        path, _, _, _, _ = create_synthetic_edfd()
+        path, _, _, _, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
@@ -201,6 +201,36 @@ class TestSyntheticEDFD:
                 mne_seg = raw.get_data(start=total, stop=total + seg.shape[1]).astype(np.float32)
                 assert np.max(np.abs(seg - mne_seg)) == 0.0
                 total += seg.shape[1]
+
+    def test_annotations(self, tmp_path):
+        annotations = [
+            (0.5, 0.0, "stim_on"),     # in segment 0
+            (1.5, 0.0, "stim_off"),    # in segment 0
+            (5.5, 2.0, "seizure"),     # in segment 1, with duration
+            (10.2, 0.0, "spike"),      # in segment 2
+        ]
+        path, _, _, _, _, _ = create_synthetic_edfd(annotations=annotations)
+        h5 = str(tmp_path / "out.h5")
+        ingest(path, output_path=h5)
+
+        with h5py.File(h5, "r") as f:
+            h5_onsets = f["events"]["onsets"][:]
+            h5_durations = f["events"]["durations"][:]
+            h5_descs = [
+                d.decode() if isinstance(d, bytes) else d
+                for d in f["events"]["descriptions"][:]
+            ]
+
+        for onset, dur, desc in annotations:
+            matched = any(
+                h5_descs[i] == desc
+                and abs(h5_onsets[i] - onset) < 0.01
+                and abs(h5_durations[i] - dur) < 0.01
+                for i in range(len(h5_onsets))
+            )
+            assert matched, (
+                f"Annotation not found: t={onset}s \"{desc}\""
+            )
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -13,13 +13,16 @@ Supported formats:
     - BrainVision (.vhdr / .eeg / .vmrk)
 
 Usage:
-    >>> from krembil_kit.io import ingest
+    >>> from krembil_kit.io import ingest, load
     >>> h5_path = ingest("data/Subject01/Subject01.edf")
-    >>> h5_path = ingest("data/Subject02/recording.vhdr",
-    ...                  output_path="output/Subject02.h5")
+    >>> data = load(h5_path)
+    >>> data.channel_names
+    ['Fp1', 'Fz', 'F3', ...]
+    >>> chunk = data.get_signals(start=0, stop=5000)
 """
 
 from ._dispatcher import ingest
+from ._loader import load, Recording
 from ._schema import SCHEMA_VERSION
 
-__all__ = ["ingest", "SCHEMA_VERSION"]
+__all__ = ["ingest", "load", "Recording", "SCHEMA_VERSION"]
