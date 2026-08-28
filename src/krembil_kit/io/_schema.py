@@ -80,18 +80,18 @@ def write_hdf5(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with h5py.File(output_path, "w") as f:
-        f.attrs["schema_version"] = SCHEMA_VERSION
+    with h5py.File(output_path, "w") as h5file:
+        h5file.attrs["schema_version"] = SCHEMA_VERSION
 
-        signals_group = f.create_group("signals")
+        signals_group = h5file.create_group("signals")
         if discontinuous:
             _write_discontinuous_signals(signals_group, signals, segment_start_times)
         else:
             _write_continuous_signals(signals_group, signals, float(sampling_rates[0]))
 
-        _write_channels(f, channel_names, channel_units, sampling_rates)
-        _write_events(f, events)
-        _write_metadata(f, metadata)
+        _write_channels(h5file, channel_names, channel_units, sampling_rates)
+        _write_events(h5file, events)
+        _write_metadata(h5file, metadata)
 
     return output_path
 
@@ -150,8 +150,8 @@ def _write_discontinuous_signals(group, segments, segment_start_times):
 
 # ── Metadata writers ────────────────────────────────────────────────
 
-def _write_channels(f, channel_names, channel_units, sampling_rates):
-    group = f.create_group("channels")
+def _write_channels(h5file, channel_names, channel_units, sampling_rates):
+    group = h5file.create_group("channels")
     group.create_dataset(
         "names", data=np.array(channel_names, dtype=h5py.string_dtype())
     )
@@ -163,8 +163,8 @@ def _write_channels(f, channel_names, channel_units, sampling_rates):
     )
 
 
-def _write_events(f, events):
-    group = f.create_group("events")
+def _write_events(h5file, events):
+    group = h5file.create_group("events")
     if events is None:
         events = {"onsets": [], "durations": [], "descriptions": []}
 
@@ -180,8 +180,8 @@ def _write_events(f, events):
     )
 
 
-def _write_metadata(f, metadata):
-    group = f.create_group("metadata")
+def _write_metadata(h5file, metadata):
+    group = h5file.create_group("metadata")
     if metadata is None:
         return
     for key, value in metadata.items():
