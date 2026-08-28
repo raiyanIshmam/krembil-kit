@@ -1,20 +1,21 @@
 """
-HDF5 Schema Writer — Version 1.0 Baseline
-==========================================
+HDF5 Schema Writer — Version 1.0
+=================================
 
-Writes the standardized HDF5 structure defined in the Version 1.0
-schema specification. All ingestion readers funnel their extracted
-data through this single writer to guarantee uniform output.
+Writes extracted recording data into the standardized HDF5 layout.
+All readers funnel their output through write_hdf5() so every file
+has the same structure regardless of source format.
 
-Schema Layout (Version 1.0):
-    /signals        — Voltage arrays (2D continuous or per-segment)
-    /channels       — Channel names, units, sampling rates
-    /events         — Annotations / markers
-    /metadata       — Global recording information
-    root attrs      — schema_version = "1.0"
+Schema layout:
+    /signals    voltage arrays (continuous: one dataset; discontinuous:
+                one dataset per segment)
+    /channels   names, units, sampling rates
+    /events     annotation onsets, durations, descriptions
+    /metadata   recording info (start time, source format, subject id)
+    root attr   schema_version
 
-Memory-safe: For continuous recordings, data is streamed from the
-MNE Raw object in chunks to avoid loading the full file into RAM.
+Continuous signals are streamed from the MNE Raw object in fixed-size
+chunks so the full recording is never held in memory at once.
 """
 
 import h5py
@@ -25,9 +26,12 @@ from typing import Dict, List, Optional, Any
 
 SCHEMA_VERSION = "1.0"
 
-# Default chunk: 60 seconds worth of data per write cycle.
-# At 500 Hz × 30 channels × 4 bytes = ~3.4 MB per chunk — trivial.
+# Signals are written this many seconds at a time. At 500 Hz with
+# 30 channels this is ~3.4 MB per chunk.
 _CHUNK_DURATION_SEC = 60.0
+
+_COMPRESSION = "gzip"
+_COMPRESSION_LEVEL = 4
 
 
 def write_hdf5(
@@ -42,37 +46,31 @@ def write_hdf5(
     segment_start_times: Optional[List[float]] = None,
 ) -> Path:
     """
-    Write extracted recording data into a Version 1.0 HDF5 file.
-
-    Supports two modes:
-      - **Streaming** (memory-safe): If `signals` is an MNE Raw object,
-        data is read and written in chunks without full preload.
-      - **Array**: If `signals` is a numpy array or list of arrays,
-        it is written directly (legacy path, for small files or
-        discontinuous segments already in memory).
+    Write recording data into a Version 1.0 HDF5 file.
 
     Parameters
     ----------
     output_path : str
         Destination path for the .h5 file.
-    signals : mne.io.Raw, np.ndarray, or list of np.ndarray
-        - mne.io.Raw: streamed in chunks (memory-safe).
-        - np.ndarray: written directly (n_channels, n_samples).
-        - list of np.ndarray: one per segment (discontinuous).
+    signals : mne.io.Raw or list of np.ndarray
+        For continuous recordings, an MNE Raw object (streamed to disk
+        in chunks). For discontinuous recordings, a list of 2D arrays,
+        one per segment.
     channel_names : list of str
         Ordered channel labels.
     channel_units : list of str
-        Physical unit for each channel (e.g., 'uV', 'mV').
+        Physical unit for each channel (e.g., 'uV').
     sampling_rates : np.ndarray
-        Sampling rate per channel (1D array, length n_channels).
+        Sampling rate per channel (1D, length n_channels).
     events : dict, optional
-        Dictionary with keys 'onsets', 'durations', 'descriptions'.
+        Keys 'onsets', 'durations', 'descriptions'. None if no events.
     metadata : dict, optional
-        Global recording info.
+        Recording info written as attributes on /metadata.
     discontinuous : bool
-        If True, signals is a list of segments (EDF+D handling).
+        True if signals is a list of segments (EDF+D).
     segment_start_times : list of float, optional
-        Absolute start time (seconds) for each segment.
+        Absolute start time (seconds) of each segment. Required when
+        discontinuous is True.
 
     Returns
     -------
@@ -83,148 +81,109 @@ def write_hdf5(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with h5py.File(output_path, "w") as f:
-        # ── Root attribute: schema version ──────────────────────────
         f.attrs["schema_version"] = SCHEMA_VERSION
 
-        # ── /signals ────────────────────────────────────────────────
-        sig_grp = f.create_group("signals")
-
+        signals_group = f.create_group("signals")
         if discontinuous:
-            _write_discontinuous_signals(
-                sig_grp, signals, segment_start_times
-            )
+            _write_discontinuous_signals(signals_group, signals, segment_start_times)
         else:
-            _write_continuous_signals(sig_grp, signals, sampling_rates)
+            _write_continuous_signals(signals_group, signals, float(sampling_rates[0]))
 
-        # ── /channels ───────────────────────────────────────────────
-        ch_grp = f.create_group("channels")
-        ch_grp.create_dataset(
-            "names",
-            data=np.array(channel_names, dtype=h5py.string_dtype()),
-        )
-        ch_grp.create_dataset(
-            "units",
-            data=np.array(channel_units, dtype=h5py.string_dtype()),
-        )
-        ch_grp.create_dataset(
-            "sampling_rates",
-            data=np.asarray(sampling_rates, dtype=np.float64),
-        )
-
-        # ── /events ────────────────────────────────────────────────
-        evt_grp = f.create_group("events")
-        if events is not None:
-            onsets = events.get("onsets", [])
-            durations = events.get("durations", [])
-            descriptions = events.get("descriptions", [])
-
-            evt_grp.create_dataset(
-                "onsets",
-                data=np.asarray(onsets, dtype=np.float64),
-            )
-            evt_grp.create_dataset(
-                "durations",
-                data=np.asarray(durations, dtype=np.float64),
-            )
-            evt_grp.create_dataset(
-                "descriptions",
-                data=np.array(
-                    descriptions, dtype=h5py.string_dtype()
-                ),
-            )
-        else:
-            evt_grp.create_dataset("onsets", data=np.array([]))
-            evt_grp.create_dataset("durations", data=np.array([]))
-            evt_grp.create_dataset(
-                "descriptions",
-                data=np.array([], dtype=h5py.string_dtype()),
-            )
-
-        # ── /metadata ──────────────────────────────────────────────
-        meta_grp = f.create_group("metadata")
-        if metadata is not None:
-            for key, value in metadata.items():
-                if value is not None:
-                    meta_grp.attrs[key] = str(value)
+        _write_channels(f, channel_names, channel_units, sampling_rates)
+        _write_events(f, events)
+        _write_metadata(f, metadata)
 
     return output_path
 
 
-# ── Internal writers ────────────────────────────────────────────────
+# ── Signal writers ──────────────────────────────────────────────────
 
-
-def _write_continuous_signals(sig_grp, signals, sampling_rates):
+def _write_continuous_signals(group, raw, sfreq):
     """
-    Write continuous signal data, streaming from MNE Raw if possible.
+    Stream a continuous recording from an MNE Raw object into a single
+    dataset, reading and writing one chunk at a time.
     """
-    # Check if signals is an MNE Raw object (duck-type check)
-    if hasattr(signals, "get_data") and hasattr(signals, "n_times"):
-        _stream_from_raw(sig_grp, signals, sampling_rates)
-    else:
-        # Direct array write (small files or pre-loaded data)
-        sig_grp.create_dataset(
-            "data",
-            data=np.asarray(signals, dtype=np.float32),
-            compression="gzip",
-            compression_opts=4,
-        )
-    sig_grp.attrs["discontinuous"] = False
-
-
-def _stream_from_raw(sig_grp, raw, sampling_rates):
-    """
-    Stream data from an MNE Raw object into HDF5 in fixed-size
-    chunks. Peak memory usage = one chunk (~60s of data).
-    """
-    sfreq = float(sampling_rates[0])
     n_channels = len(raw.ch_names)
     n_samples = raw.n_times
     chunk_samples = int(_CHUNK_DURATION_SEC * sfreq)
 
-    # Create the dataset with final shape, fill in chunks
-    ds = sig_grp.create_dataset(
+    dataset = group.create_dataset(
         "data",
         shape=(n_channels, n_samples),
         dtype=np.float32,
-        compression="gzip",
-        compression_opts=4,
+        compression=_COMPRESSION,
+        compression_opts=_COMPRESSION_LEVEL,
         chunks=(n_channels, min(chunk_samples, n_samples)),
     )
 
-    # Write in chunks
     start = 0
     while start < n_samples:
         stop = min(start + chunk_samples, n_samples)
-        chunk = raw.get_data(start=start, stop=stop)
-        ds[:, start:stop] = chunk.astype(np.float32)
+        dataset[:, start:stop] = raw.get_data(start=start, stop=stop).astype(np.float32)
         start = stop
 
+    group.attrs["discontinuous"] = False
 
-def _write_discontinuous_signals(sig_grp, signals, segment_start_times):
+
+def _write_discontinuous_signals(group, segments, segment_start_times):
     """
-    Write discontinuous segments. Each segment is typically small
-    enough to write directly (gaps imply shorter arrays).
+    Write each segment of a discontinuous recording as its own dataset,
+    tagged with its absolute start time.
     """
     if segment_start_times is None:
         raise ValueError(
-            "segment_start_times is required for "
-            "discontinuous recordings."
+            "segment_start_times is required for discontinuous recordings."
         )
 
-    for idx, (seg, t0) in enumerate(
-        zip(signals, segment_start_times)
-    ):
-        # If segment is an MNE Raw object, extract its data
-        if hasattr(seg, "get_data"):
-            seg = seg.get_data()
-
-        ds = sig_grp.create_dataset(
+    for idx, (segment, start_time) in enumerate(zip(segments, segment_start_times)):
+        dataset = group.create_dataset(
             f"segment_{idx}",
-            data=np.asarray(seg, dtype=np.float32),
-            compression="gzip",
-            compression_opts=4,
+            data=np.asarray(segment, dtype=np.float32),
+            compression=_COMPRESSION,
+            compression_opts=_COMPRESSION_LEVEL,
         )
-        ds.attrs["start_time_seconds"] = float(t0)
+        dataset.attrs["start_time_seconds"] = float(start_time)
 
-    sig_grp.attrs["discontinuous"] = True
-    sig_grp.attrs["n_segments"] = len(signals)
+    group.attrs["discontinuous"] = True
+    group.attrs["n_segments"] = len(segments)
+
+
+# ── Metadata writers ────────────────────────────────────────────────
+
+def _write_channels(f, channel_names, channel_units, sampling_rates):
+    group = f.create_group("channels")
+    group.create_dataset(
+        "names", data=np.array(channel_names, dtype=h5py.string_dtype())
+    )
+    group.create_dataset(
+        "units", data=np.array(channel_units, dtype=h5py.string_dtype())
+    )
+    group.create_dataset(
+        "sampling_rates", data=np.asarray(sampling_rates, dtype=np.float64)
+    )
+
+
+def _write_events(f, events):
+    group = f.create_group("events")
+    if events is None:
+        events = {"onsets": [], "durations": [], "descriptions": []}
+
+    group.create_dataset(
+        "onsets", data=np.asarray(events["onsets"], dtype=np.float64)
+    )
+    group.create_dataset(
+        "durations", data=np.asarray(events["durations"], dtype=np.float64)
+    )
+    group.create_dataset(
+        "descriptions",
+        data=np.array(events["descriptions"], dtype=h5py.string_dtype()),
+    )
+
+
+def _write_metadata(f, metadata):
+    group = f.create_group("metadata")
+    if metadata is None:
+        return
+    for key, value in metadata.items():
+        if value is not None:
+            group.attrs[key] = str(value)
