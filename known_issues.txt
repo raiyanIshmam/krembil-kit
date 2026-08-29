@@ -1,6 +1,54 @@
 KNOWN ISSUES AND DEFERRED WORK
 
-1. EDF+D MEMORY WITH MANY LARGE SEGMENTS
+1. MIXED SAMPLING RATES PER CHANNEL ARE NOT SUPPORTED
+   EDF permits each channel to have its own sampling rate. Files that
+   use this (e.g. PhysioNet Sleep-EDF: EEG at 100 Hz alongside
+   respiration and temperature at 1 Hz) are refused by the reader with
+   a ValueError rather than ingested.
+
+   Cause: MNE resamples slow channels onto a common grid. With
+   preload=False the interpolation lacks context beyond each chunk, so
+   the values returned depend on where chunk boundaries fall
+   (mne-python issue #10635). Our writer chunks at 60 s while
+   verification reads at 10 s, and the two disagreed by ~1800 units.
+
+   Current behaviour: _reject_mixed_sampling_rates() in _readers_edf.py
+   inspects the signal headers before opening the file and raises if the
+   ordinary channels do not share one rate. Annotation channels are
+   excluded from the comparison, since their samples-per-record is a
+   byte budget for text rather than a sampling rate. Uniform-rate files
+   are unaffected — with nothing to resample, MNE returns identical
+   values regardless of chunk boundaries, which is why full
+   sample-by-sample verification passes at zero error on those.
+
+   Neither MNE mode is satisfactory:
+     preload=False  edge artifacts at every chunk boundary
+     preload=True   upsamples slow channels, inventing samples that
+                    were never recorded, which breaks the lossless
+                    guarantee in datamodule.txt
+
+   Options to evaluate:
+     a) Store each channel as its own dataset at its native rate.
+        Fully lossless and still memory-safe: we already read EDF byte
+        geometry directly for TAL parsing, so per-channel samples can
+        be read at native rates without MNE resampling at all. Costs a
+        schema addition and some downstream handling. Most promising.
+     b) Detect mixed rates and refuse to ingest, with a clear error.
+        Honest, but unhelpful for sleep studies.
+     c) Ingest at the highest rate with preload=True and record the
+        upsampling in /metadata. Rejected: preload=True risks the
+        memory problem we designed the streaming writer to avoid, and
+        more importantly it fabricates samples that were never
+        recorded, which no amount of documentation makes lossless.
+
+   Tests: TestRealEDF detects mixed rates and skips those files, and a
+   separate test_mixed_rates_rejected asserts that ingesting one raises.
+   The skip keeps the condition visible; the separate test pins the
+   intended behaviour rather than merely tolerating the failure.
+   Priority: Medium. Affects polysomnography data specifically;
+   pure EEG recordings use a uniform rate.
+
+2. EDF+D MEMORY WITH MANY LARGE SEGMENTS
    The discontinuous reader builds a list of all segments in memory
    before passing them to the schema writer. If a file has many
    large segments (e.g., 100 segments × 200 MB each), peak memory
@@ -9,3 +57,87 @@ KNOWN ISSUES AND DEFERRED WORK
    the reader-writer interface for the discontinuous case.
    Priority: Low (current test files work fine; only affects
    multi-GB discontinuous recordings with many segments).
+3. TRUNCATED FILES ARE NOT DETECTED
+   The EDF header states how many data records the file contains, and
+   the signal headers state how large each record is. Together with the
+   header size, that fully determines the expected file size:
+
+       expected = header_size + n_records * record_size
+
+   Nothing currently compares that against the actual size on disk, so
+   a truncated file (interrupted download, disk full mid-write, partial
+   copy) is read as though it were complete.
+
+   Consequence: in the record loop in _parse_tals, reading past
+   end-of-file returns fewer bytes or none. Those empties are skipped
+   by the `if not tal` guard, so record_onsets ends up shorter than
+   n_records and no error is raised. The result is fewer segments than
+   the recording actually contains, silently.
+
+   Two cheap checks worth adding together, both fail-fast in the same
+   spirit as the mixed-rate guard:
+
+     a) Size check. Compare expected against os.path.getsize() and
+        raise if the file is short.
+     b) Header cross-check. Offset 184 of the fixed header already
+        holds the header size as a number. We compute it instead as
+        256 + 256 * n_signals, which is the more robust choice since
+        n_signals is load-bearing everywhere else. But reading 184 and
+        comparing against the computed value costs nothing and catches
+        a malformed header before any parsing happens.
+
+   Priority: Low-Medium. No known instance yet, but the failure mode is
+   silent, which is the kind we most want to eliminate.
+
+   Related check, same family: nothing verifies that the TAL walk
+   produced one onset per record. If a record yields no parseable
+   timestamp, the `continue` skips it and record_onsets ends up shorter
+   than n_records, so _segment_boundaries computes ranges from fewer
+   records than the file holds — again silently. One assertion closes
+   it:
+
+       if len(record_onsets) != n_records:
+           raise ValueError(...)
+
+   A spec-compliant file always has a time-keeping TAL in every record
+   (spec 2.2.4), so this only fires on malformed input. Natural to add
+   wherever the header validation from (a) and (b) lands.
+
+4. CHANNEL UNITS ARE NOT READ FROM THE FILE
+   _channel_units() derives the unit string from MNE's per-channel unit
+   code rather than from the EDF header's physical dimension field.
+
+   Measured on all three real test files: MNE assigns code 107
+   (FIFF_UNIT_V) to every EDF channel regardless of what the header
+   says, so the function always returns "V". Its other two branches
+   cannot execute — 201 is FIFF_UNIT_T, tesla, which is MEG-only, and
+   the else branch is unreachable because 107 is assigned universally.
+
+   For every file we currently accept the answer is still correct.
+   annotated.edf and discontinuous.EDF are all-uV in the header, MNE
+   rescales uV to V, so the stored array genuinely is in volts. Correct
+   by accident rather than by reasoning.
+
+   The wrong case exists but is currently unreachable. sub1.edf has a
+   "Temp rectal" channel whose physical dimension is DegC, plus two
+   channels with a blank dimension. All three would be labelled "V".
+   That file is refused by the mixed-rate guard, so the mislabel cannot
+   reach HDF5 today.
+
+   Same root cause as item 1: MNE normalizes away per-channel
+   properties, and the EDF header holds the truth. Each signal header
+   carries an 8-byte physical dimension field stating the unit as text.
+
+   Decision required before fixing: should channel_units describe the
+   units in the FILE, or the units of the ARRAY WE STORE? Those differ
+   precisely because MNE rescales. Whichever is chosen must be stated
+   in the docstring, since a downstream consumer reading "V" when the
+   data is microvolts is a factor of a million.
+
+   Do this together with item 1 option (a). Both need the same thing —
+   per-channel facts read from the signal headers instead of inferred
+   from MNE.
+
+   Priority: Low while the guard blocks the only affected file, Medium
+   once mixed-rate support lands, because that removes the guard and
+   makes DegC channels ingestable.

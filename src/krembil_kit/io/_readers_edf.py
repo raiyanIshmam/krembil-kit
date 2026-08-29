@@ -21,8 +21,6 @@ per the EDF+ specification (Kemp & Olivan, 2003). Each segment is
 read individually from disk.
 """
 
-import re
-import struct
 import numpy as np
 import mne
 from pathlib import Path
@@ -56,6 +54,7 @@ def detect_edf_subtype(file_path: str) -> str:
 def read_edf(file_path: str) -> Dict[str, Any]:
     """Read a plain EDF file (no annotations)."""
     file_path = str(Path(file_path).resolve())
+    _reject_mixed_sampling_rates(file_path)
     raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
 
     return {
@@ -73,6 +72,7 @@ def read_edf(file_path: str) -> Dict[str, Any]:
 def read_edf_plus_c(file_path: str) -> Dict[str, Any]:
     """Read an EDF+C file (continuous, with annotations)."""
     file_path = str(Path(file_path).resolve())
+    _reject_mixed_sampling_rates(file_path)
     raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
 
     return {
@@ -100,6 +100,7 @@ def read_edf_plus_d(file_path: str) -> Dict[str, Any]:
     because MNE drops annotations outside its concatenated timeline.
     """
     file_path = str(Path(file_path).resolve())
+    _reject_mixed_sampling_rates(file_path)
     raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
 
     sfreq = raw.info["sfreq"]
@@ -136,6 +137,66 @@ def read_edf_plus_d(file_path: str) -> Dict[str, Any]:
 
 
 # ────────────────────────────────────────────────────────────────────
+# Private: header inspection
+# ────────────────────────────────────────────────────────────────────
+
+def _channel_sampling_rates(file_path: str) -> List[float]:
+    """
+    Read the sampling rate of each ordinary signal from the EDF header.
+
+    EDF stores a samples-per-record count per signal, so channels may
+    run at different rates. Annotation channels are excluded: their
+    sample count is a byte budget for text, not a sampling rate.
+    """
+    with open(file_path, "rb") as fh:
+        fh.seek(244)
+        record_duration = float(fh.read(8).decode("ascii").strip())
+        n_signals = int(fh.read(4).decode("ascii").strip())
+
+        fh.seek(256)
+        labels = [
+            fh.read(16).decode("ascii", errors="ignore").strip()
+            for _ in range(n_signals)
+        ]
+
+        fh.seek(256 + 216 * n_signals)
+        samples_per_record = [
+            int(fh.read(8).decode("ascii").strip()) for _ in range(n_signals)
+        ]
+
+    # Files holding only annotations may declare a record duration of 0
+    # (EDF+ spec 2.1.2). There are no ordinary signals to compare.
+    if record_duration == 0:
+        return []
+
+    return [
+        samples / record_duration
+        for samples, label in zip(samples_per_record, labels)
+        if label != "EDF Annotations"
+    ]
+
+
+def _reject_mixed_sampling_rates(file_path: str) -> None:
+    """
+    Raise if the channels do not share a single sampling rate.
+
+    MNE cannot return such files faithfully. With preload=False it
+    upsamples slow channels lazily, so values near chunk boundaries
+    depend on how the file is sliced. With preload=True it upsamples
+    eagerly, fabricating samples that were never recorded. Refusing is
+    preferable to writing data that looks plausible but is wrong.
+    See known_issues.txt.
+    """
+    rates = sorted(set(_channel_sampling_rates(file_path)))
+    if len(rates) > 1:
+        raise ValueError(
+            f"{Path(file_path).name} has mixed per-channel sampling rates "
+            f"({rates} Hz). This cannot be ingested losslessly and is not "
+            f"yet supported."
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Private: TAL parsing and segment detection
 # ────────────────────────────────────────────────────────────────────
 
@@ -156,15 +217,6 @@ def _read_record_params(file_path: str) -> Tuple[float, int]:
     n_records = int(raw_nrecords)
     duration = float(raw_duration)
     return duration, n_records
-
-
-def _parse_tal_onsets(file_path: str) -> List[float]:
-    """
-    Extract the onset time from the first TAL in each data record.
-    Wrapper around _parse_tals that returns only the record onsets.
-    """
-    onsets, _ = _parse_tals(file_path)
-    return onsets
 
 
 def _parse_tals(file_path: str):
@@ -198,12 +250,23 @@ def _parse_tals(file_path: str):
         for _ in range(n_signals):
             labels.append(fh.read(16).decode("ascii", errors="ignore").strip())
 
-        annot_idx = None
-        for i, label in enumerate(labels):
-            if "annotation" in label.lower():
-                annot_idx = i
-        if annot_idx is None:
+        # The label is fixed by EDF+ spec 2.2.2. Spec 2.2.4 puts
+        # time-keeping in the FIRST annotation signal only, and further
+        # annotation signals need not carry one at all, so reading the
+        # wrong signal would yield event times in place of record start
+        # times. Refuse rather than guess. See known_issues.txt.
+        annot_indices = [
+            i for i, label in enumerate(labels) if label == "EDF Annotations"
+        ]
+        if not annot_indices:
             return [], []
+        if len(annot_indices) > 1:
+            raise ValueError(
+                f"{Path(file_path).name} declares {len(annot_indices)} "
+                f"'EDF Annotations' signals (indices {annot_indices}). "
+                f"Only one is supported."
+            )
+        annot_idx = annot_indices[0]
 
         signal_sizes = [s * 2 for s in samples_per_record]
         record_size = sum(signal_sizes)

@@ -17,6 +17,7 @@ import pytest
 from pathlib import Path
 
 from krembil_kit.io import ingest, SCHEMA_VERSION
+from krembil_kit.io._readers_edf import _channel_sampling_rates
 from conftest import (
     DATA_DIR, require_file, require_dir,
     create_synthetic_edf, create_synthetic_edfd,
@@ -241,16 +242,38 @@ EDF_DIR = DATA_DIR / "test_edf"
 _edf_files = sorted(EDF_DIR.glob("*.edf")) if EDF_DIR.is_dir() else []
 
 
+def _has_mixed_rates(path):
+    """True if the file's channels do not share one sampling rate."""
+    return len(set(_channel_sampling_rates(str(path)))) > 1
+
+
 class TestRealEDF:
 
     @pytest.mark.parametrize("edf_file", _edf_files, ids=[f.name for f in _edf_files])
     def test_signals(self, edf_file, tmp_path):
         require_file(edf_file)
+        if _has_mixed_rates(edf_file):
+            pytest.skip("mixed sampling rates — see test_mixed_rates_rejected")
+
         h5 = str(tmp_path / "out.h5")
         ingest(str(edf_file), output_path=h5)
         raw = mne.io.read_raw_edf(str(edf_file), preload=False, verbose=False)
         verify_structure(h5, raw.ch_names, raw.info["sfreq"], expect_discontinuous=False)
         verify_signals(h5, raw)
+
+    @pytest.mark.parametrize("edf_file", _edf_files, ids=[f.name for f in _edf_files])
+    def test_mixed_rates_rejected(self, edf_file, tmp_path):
+        """
+        Files with per-channel sampling rates cannot be ingested
+        losslessly, so ingest must refuse them rather than write
+        resampled data. See known_issues.txt item 1.
+        """
+        require_file(edf_file)
+        if not _has_mixed_rates(edf_file):
+            pytest.skip("uniform sampling rates")
+
+        with pytest.raises(ValueError, match="mixed per-channel sampling rates"):
+            ingest(str(edf_file), output_path=str(tmp_path / "out.h5"))
 
 
 # ────────────────────────────────────────────────────────────────────
