@@ -42,15 +42,20 @@ Correctness questions (Step 3)
     budget into the rate comparison and those fixtures would have been
     falsely rejected. They pass, so the library writes the spec label.
 
-    Real-data tests were not re-run (24 min, deferred to Step 6). Their
-    behaviour is unchanged by measurement rather than assumption: both
-    real files were read directly and each declares exactly one
-    annotation channel labelled exactly "EDF Annotations", raw
+    Real files measured directly before the edit: each declares exactly
+    one annotation channel labelled exactly "EDF Annotations", raw
     'EDF Annotations ' space-padded to 16 bytes.
         annotated.edf       idx 33
         discontinuous.EDF   idx 80
     So the exact match selects the same channel the loose match did, and
     the multiplicity check passes with a count of one.
+
+    Then confirmed by execution as well:
+        pytest -k "Synthetic or Errors or RealEDF"
+        35 passed, 2 skipped, 5 deselected in 1502.44s
+    Identical counts to the Step 0 baseline (which took 1424.42s; the
+    difference is machine variance). Step 3 item 1 is therefore verified
+    against real data, not just the synthetic fixtures.
 
     This is a real bug, not a style question. Spec 2.2.4 puts
     time-keeping in "the first annotation of the first 'EDF
