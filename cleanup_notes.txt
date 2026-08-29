@@ -1,0 +1,747 @@
+CLEANUP NOTES — _readers_edf.py
+(temporary working file, delete when cleanup is complete)
+
+METHOD
+  Step 0  Baseline: full test suite, record what passes
+  Step 1  Provably-safe deletions (dead imports, unreferenced funcs)
+  Step 2  Read and map, no edits — build understanding, flag concerns
+  Step 3  Resolve correctness questions
+  Step 4  Structural changes, one at a time
+  Step 5  Naming and docstrings
+  Step 6  Full suite, diff against Step 0
+
+Rule: never mix a logic change with a cosmetic change in one step.
+
+
+PRELIMINARY FINDINGS
+
+Provably safe to delete (Step 1)
+  - import re          old regex parser removed; no longer referenced
+  - import struct      never used in this file
+  - _parse_tal_onsets  leftover wrapper; read_edf_plus_d calls
+                       _parse_tals directly
+
+Correctness questions (Step 3)
+  - annot_idx loop has no break, so it selects the LAST annotation
+    channel when a file has several. EDF+ permits multiple.
+
+    DECIDED AND IMPLEMENTED: refuse files with more than one annotation
+    channel, and match the label exactly.
+
+    Two edits made:
+      _parse_tals              annot_idx loop replaced by an
+                               annot_indices list, exact label match,
+                               ValueError if more than one, take [0]
+      _channel_sampling_rates  `"annotation" not in label.lower()`
+                               became `label != "EDF Annotations"`
+
+    Verified: pytest -k "Synthetic or Errors" -> 27 passed, identical to
+    the Step 1 baseline. That also resolved the open risk that the
+    synthetic EDF+C writer library might use a different label — if it
+    did, the exact match would have let the annotation channel's text
+    budget into the rate comparison and those fixtures would have been
+    falsely rejected. They pass, so the library writes the spec label.
+
+    Real-data tests were not re-run (24 min, deferred to Step 6). Their
+    behaviour is unchanged by measurement rather than assumption: both
+    real files were read directly and each declares exactly one
+    annotation channel labelled exactly "EDF Annotations", raw
+    'EDF Annotations ' space-padded to 16 bytes.
+        annotated.edf       idx 33
+        discontinuous.EDF   idx 80
+    So the exact match selects the same channel the loose match did, and
+    the multiplicity check passes with a count of one.
+
+    This is a real bug, not a style question. Spec 2.2.4 puts
+    time-keeping in "the first annotation of the first 'EDF
+    Annotations' signal" — the FIRST signal specifically. Additional
+    annotation signals need not carry a time-keeping TAL at all, so
+    their first TAL can be an ordinary event. Taking the last match
+    would therefore read record_onsets from arbitrary event times,
+    and _segment_boundaries would compute gaps from them. Wrong
+    segment count, wrong sample ranges, no error raised. Plus every
+    TAL in the first annotation signal goes unread.
+
+    Chose refusal over parsing all of them for the same reason as the
+    mixed-rate guard: turn silent corruption into a loud refusal, fill
+    the capability gap deliberately later with a real file to test
+    against. Refusal also makes the two annotation-detection sites
+    agree by construction — _channel_sampling_rates excludes ALL
+    annotation channels, and if at most one may exist then "all" and
+    "the one" are the same set.
+
+    Measured: every real test file has at most one, so the guard is a
+    no-op across the suite.
+        annotated.edf       34 signals -> 33 channels   1 annot
+        discontinuous.EDF   81 signals -> 80 channels   1 annot
+        sub1.edf             7 signals ->  7 channels   0 annot
+
+    PRECONDITION before implementing: confirm the exact label string in
+    the real files. Both detection sites currently use
+    `"annotation" in label.lower()`. If a real file's label is not
+    exactly "EDF Annotations", switching _channel_sampling_rates to an
+    exact match would stop excluding that channel, its 1408 Hz text
+    budget would enter the rate comparison, and the file would be
+    falsely refused as mixed-rate. Verify before editing, not after.
+    Note the inconsistency: _reject_mixed_sampling_rates excludes
+    EVERY annotation channel from the rate comparison, while
+    _parse_tals keeps only the last and parses just that one. With one
+    annotation channel they agree; with two they diverge silently.
+    Measured: discontinuous.EDF has exactly one (index 80), so this is
+    a spec-permitted case we do not currently exercise. Decide between
+    parsing all of them or refusing files with more than one.
+  - `if not tal or tal == b"\x00"` — second condition unreachable
+    after splitting on \x00
+  - `if not parts or not parts[0]` — first condition unreachable.
+    bytes.split() always returns at least one element, so only
+    `not parts[0]` can ever fire.
+  - tighten the annotation-channel test from
+    `"annotation" in label.lower()` to `label == "EDF Annotations"`.
+    That exact string is mandated by spec 2.2.2, so matching it
+    exactly is stricter without being fragile. Decided: do it.
+
+  - _channel_units is effectively a constant function.
+    MEASURED — see EVIDENCE (units) below.
+
+      MNE reports unit code 107 for every channel of every real test
+      file, including a DegC temperature channel and two channels whose
+      physical dimension field is blank. Code 201 is FIFF_UNIT_T,
+      tesla, which is MEG-only and cannot appear in EDF. So the first
+      branch always fires and the other two are unreachable:
+
+        if code == 107:   "V"     always
+        elif code == 201: "T"     unreachable for EDF
+        else:             "uV"    unreachable, MNE assigns 107 to all
+
+      The function is ["V"] * n_channels written as a three-way test.
+
+      For every file we currently ACCEPT the answer "V" is correct:
+      annotated.edf and discontinuous.EDF are all-uV in the header and
+      MNE rescales uV to V, so the stored array really is volts. It is
+      correct by accident, not by reasoning.
+
+      The wrong case is real but currently unreachable. sub1.edf's
+      "Temp rectal" is DegC in the header and would be labelled "V".
+      That file is already refused by the mixed-rate guard, so the
+      mislabel cannot reach HDF5 today. Latent, not active.
+
+      Same root cause as the mixed-rate issue: MNE normalizes away
+      per-channel properties and the EDF header holds the truth. The
+      header's 8-byte physical dimension field per signal states the
+      unit as text. Decision needed on the contract before fixing:
+      should channel_units describe the units in the FILE, or the units
+      of the ARRAY WE STORE? Those differ, because MNE rescales. Pick
+      one and say so in the docstring. Do not fix this before the
+      mixed-rate work, since both want the same header reader.
+
+  - _segment_boundaries tolerance vs its own docstring.
+    RESOLVED BY MEASUREMENT — see EVIDENCE below. Not a bug on real
+    data, so this became a Step 4/5 readability item rather than a
+    correctness fix.
+
+      Docstring says a gap is a jump of "more than one record
+      duration". Code uses `tolerance = record_duration * 1.5` and
+      compares it against the DEVIATION from the next contiguous slot,
+      so the smallest hole it detects is one larger than 1.5 record
+      durations:
+
+        contiguous     spacing 0.250s -> deviation 0.000  no gap
+        0.25s hole     spacing 0.500s -> deviation 0.250  no gap
+        0.375s hole    spacing 0.625s -> deviation 0.375  no gap
+        0.4s hole      spacing 0.650s -> deviation 0.400  GAP
+
+      A single missing record therefore passes as contiguous. No
+      samples are lost, since MNE has already handed over every
+      record, but the segment count would be low by one and the
+      absorbed tail would inherit the wrong onset_time.
+
+      Recommendation: record_duration * 0.5. Largest threshold that
+      still cannot confuse "contiguous" with "one record missing",
+      measured to give 7 segments, and it makes the docstring true.
+
+Structural (Step 4)
+
+  MAIN IDEA — one header reader, everyone else reads from it.
+  Parse the EDF header once into a single object holding every fact
+  derived from it, then have the other functions take that object
+  instead of a file path. Absorbs most of the separate findings below.
+
+    Facts it would hold:
+      n_records, record_duration, n_signals
+      labels, samples_per_record
+      header_size (computed 256 + 256*ns)
+      declared_header_size (offset 184, for cross-check)
+      derived: signal_sizes, record_size,
+               annotation channel index, per-channel sampling rates
+
+    What it fixes:
+      - header currently read three times per EDF+D ingest
+        (_channel_sampling_rates, _read_record_params, _parse_tals),
+        three file opens for overlapping bytes
+      - labels, samples_per_record, duration and ns each parsed twice
+      - "which signal is the annotation channel" answered in two
+        places with two different multiplicity rules
+      - makes _reject_mixed_sampling_rates a pure function on the
+        object with no file I/O, so it becomes trivially testable
+      - gives record_size a home, which the truncation check in
+        known_issues item 3 needs
+
+    TRAP TO DESIGN AROUND — header signals != MNE channels.
+      Measured on discontinuous.EDF: 81 signals in the header, 80
+      channels from MNE. MNE drops the annotation channel from
+      ch_names. So every list the header reader holds (labels,
+      samples_per_record, signal_sizes, units) is one longer than
+      raw.ch_names whenever annotations are present.
+
+      Today the two index spaces never meet: _channel_sampling_rates
+      works in header indices, _uniform_rates only needs MNE's count.
+      Putting them in one object invites a silent zip() of an 81-list
+      against an 80-list. Either keep the annotation channel out of the
+      object's per-channel lists, or name the fields so the index space
+      is unmistakable. Decide this before writing the dataclass, not
+      after.
+
+    Form: small frozen dataclass reads best. NamedTuple or dict also
+    viable. Decide when implementing.
+
+    NAMING MUST BE STATED, NOT JUST FOLLOWED.
+      A signal_* / channel_* prefix convention is only useful if a
+      reader knows it exists. State it once in the module docstring,
+      alongside the byte-layout material moving there in Step 5:
+
+        signal   an entry in the EDF header. All 81, including the
+                 EDF Annotations signal. This is the spec's own word,
+                 and the spec further distinguishes "ordinary signals"
+                 from the annotation signal.
+        channel  what we expose downstream. The 80 ordinary signals.
+                 Matches raw.ch_names.
+
+      Without that, the prefixes are a private code and the next reader
+      will mis-zip anyway.
+
+    HOW MUCH SHOULD COME FROM THE HEADER RATHER THAN MNE.
+      The instinct "MNE is fine except for EDF+D" does not survive the
+      evidence. Where MNE has actually failed, measured:
+
+        EDF+D annotations     dropped 304 of 346         EDF+D only
+        EDF+D segment gaps    gaps unrecoverable         EDF+D only
+        mixed sampling rates  resamples or fabricates    plain EDF
+                                                         (sub1/sub2)
+        channel units         107 for a DegC channel     every format
+
+      Two of four are EDF+D. sub1.edf is a plain EDF file. Units affect
+      everything. So the split is not by file type — it is samples vs
+      metadata:
+
+        samples    MNE is excellent, keep it. preload=False plus
+                   get_data(start, stop) gives bounded-memory random
+                   access into a 645 MB file. Replacing it means
+                   writing digital-to-physical scaling, chunked reads
+                   and per-record deinterleaving ourselves.
+
+        metadata   MNE normalizes, and normalizing is lossy. Units
+                   collapse to one code, per-channel rates to one
+                   sfreq, annotations to MNE's timeline, patient and
+                   recording fields to MNE's interpretation. The header
+                   states all of it in plain ASCII at fixed offsets.
+
+      This is cheaper than it sounds because we already do it.
+      _read_record_params, _channel_sampling_rates, _parse_tals and
+      detect_edf_subtype all read raw header bytes today. The header
+      reader consolidates existing work rather than adding new.
+      Extending it to units and patient fields is a few more seek/read
+      pairs at known offsets in the loop pattern already written.
+
+      ONE EXCEPTION: mixed-rate support (known_issues item 1 option a)
+      requires reading sample DATA ourselves, since MNE cannot return
+      per-channel native rates at all. That is the one item crossing
+      into expensive territory, which is why it stays a separate
+      deliberate task rather than part of cleanup.
+
+  Remaining, not absorbed by the above
+  - _parse_tals would still do two jobs after the header work moves
+    out: walk records, and parse TAL bytes. Possibly split further.
+  - _segment_boundaries is hard to read. Two causes, confirmed by
+    reading it aloud: n_records_in_seg, and no comment saying WHERE the
+    gap sits relative to the loop index. Three options were compared.
+
+    DECIDED: do option A now. Keep B as a possible follow-up. Leave C
+    open — not yet clear which is cleanest, and A does not foreclose
+    either.
+
+    OPTION A (chosen) — keep the loop shape, remove the confusing
+    variable, invert the test to unnest the body, add the missing
+    comment.
+
+        segments = []
+        segment_start = 0
+
+        for record in range(1, len(record_onsets)):
+            expected_onset = record_onsets[record - 1] + record_duration
+            if abs(record_onsets[record] - expected_onset) <= gap_threshold:
+                continue
+
+            # The gap sits between record-1 and record. So the segment
+            # being built covers records segment_start .. record-1, and
+            # the next segment begins at record.
+            segments.append((
+                segment_start * samples_per_record,
+                record * samples_per_record,
+                record_onsets[segment_start],
+            ))
+            segment_start = record
+
+        # No gap follows the last record, so the final segment is closed
+        # against the end of the list rather than by a detected gap.
+        segments.append((
+            segment_start * samples_per_record,
+            len(record_onsets) * samples_per_record,
+            record_onsets[segment_start],
+        ))
+
+        return segments
+
+    n_records_in_seg disappears because record * samples_per_record
+    already IS the stop position. That was the specific variable that
+    made the function unreadable. The duplication remains but each block
+    is three obvious multiplications, and the comments explain why there
+    are two of them.
+
+    OPTION B (possible follow-up) — as A, plus a helper to remove the
+    duplication:
+
+        def _segment(record_onsets, first_record, stop_record,
+                     samples_per_record):
+            """
+            Describe records [first_record, stop_record) as
+            (start_sample, stop_sample, onset).
+            """
+            return (
+                first_record * samples_per_record,
+                stop_record * samples_per_record,
+                record_onsets[first_record],
+            )
+
+    Both call sites become one line and their only difference is
+    visible: `record` vs `len(record_onsets)`. Costs four positional
+    arguments and one hop to read the helper. For a function this short
+    that is roughly a wash, which is why it is deferred rather than
+    rejected. A -> B is an easy later step.
+
+    OPTION C (open) — two phases, gap detection then sample conversion:
+
+        boundaries = [0]
+        for record in range(1, len(record_onsets)):
+            expected_onset = record_onsets[record - 1] + record_duration
+            if abs(record_onsets[record] - expected_onset) > gap_threshold:
+                boundaries.append(record)
+        boundaries.append(len(record_onsets))
+
+        return [
+            (start * samples_per_record,
+             stop * samples_per_record,
+             record_onsets[start])
+            for start, stop in zip(boundaries, boundaries[1:])
+        ]
+
+    Cleanest separation of concerns and no duplication at all. Against
+    it: zip(boundaries, boundaries[1:]) is an idiom the reader must
+    decode before reading the logic, and the last element of the list is
+    a sentinel that is not really a segment start. Trades one puzzle for
+    another. Written longhand as an explicit loop it loses much of its
+    appeal.
+
+    Verified equivalent on a 10-record example, gaps after records 3
+    and 6, 256 samples per record:
+        boundaries = [0, 4, 7, 10]
+        pairs (0,4) (4,7) (7,10)
+        -> (0,1024,0.0) (1024,1792,100.0) (1792,2560,500.0)
+    matches the current implementation's output.
+
+    ORTHOGONAL, applies to whichever option — return a NamedTuple
+    instead of a bare 3-tuple:
+
+        segments.append(Segment(
+            start_sample=segment_start * samples_per_record,
+            stop_sample=record * samples_per_record,
+            onset=record_onsets[segment_start],
+        ))
+
+    Reads without consulting a docstring, and the unpacking in
+    read_edf_plus_d gets the same benefit. Worth doing regardless.
+  - _segment_boundaries recomputes samples per record as
+    int(record_duration * sfreq) instead of reading it from the
+    header. Measured exact for discontinuous.EDF: int(0.25 * 1024)
+    = 256, matching the header. But int() truncates, so a file whose
+    record_duration is not exactly representable could land on 255 and
+    drift every boundary. The header holds the true integer and the
+    Step 4 header reader would already carry it, so read it.
+  - _segment_boundaries takes n_records but uses it only in the
+    "no onsets" fallback; every other line counts len(tal_onsets).
+    Once the header reader exists, revisit whether the parameter and
+    the fallback are both still needed — _parse_tals only returns an
+    empty list when there is no annotation channel, which an EDF+D
+    file cannot lack.
+
+  - _parse_tals record walk can drop its cursor bookkeeping entirely.
+    Record i always begins at header_size + i * record_size, so the
+    position can be computed rather than accumulated:
+
+        for i in range(n_records):
+            fh.seek(header_size + i * record_size + annot_offset_in_record)
+            annot_data = fh.read(annot_bytes)
+
+    That removes tell() and the trailing seek(record_start +
+    record_size). The trailing seek is NOT currently redundant — it is
+    what lets annot_offset_in_record handle an annotation channel that
+    is not the last signal. It only looks redundant because in our
+    files the annotation channel IS last, so read() happens to land on
+    the next record. Computing the offset makes correctness independent
+    of cursor state, so there is no drift to reason about at all.
+
+  - strip the trailing padding before splitting the annotation block.
+
+        tals = annot_data.rstrip(b"\x00").split(b"\x00")
+
+    Today the padding becomes empty list entries that the loop walks
+    and discards one by one. Record 1 produces 666 pieces of which 664
+    are empty; across 16,246 records that is roughly 10.8 million
+    no-op iterations.
+
+    rstrip removes matching bytes from the right end only and stops at
+    the first non-matching byte, so interior separators are untouched.
+    It also removes the final TAL's own terminator, which is harmless:
+    split divides on separators and whatever follows the last one is
+    the final piece, and the closing \x14 that the inner split needs is
+    preserved because rstrip is given only \x00.
+
+    Verified behaviour-preserving on record 1:
+        before  [b'+0.848\x14\x14', b'+0.891\x14Clip Note\x14', 664 x b'']
+        after   [b'+0.848\x14\x14', b'+0.891\x14Clip Note\x14']
+    and the last TAL still splits to
+        [b'+0.891', b'Clip Note', b'']  — identical to today.
+
+    Keep the `if not tal` guard: a record that is entirely padding
+    rstrips to b'' and splits to [b''], one empty piece rather than
+    hundreds.
+
+    Careful: rstrip takes a SET of byte values, not a sequence. Passing
+    b"\x14\x00" would strip either byte from the right and eat the last
+    TAL's closing \x14.
+
+  - read_edf and read_edf_plus_c are the same function twice. Both
+    resolve the path, call the guard, call read_raw_edf(preload=False),
+    and build an eight-key dict. Only two values differ, and one of
+    those is not a real difference:
+
+        events         None  vs  _annotations_to_events(raw)
+                             plain EDF has no annotation channel, so
+                             _annotations_to_events returns None anyway
+        source_format  "EDF" vs "EDF+C"
+
+    Suggested shape: keep all three public readers so the dispatcher's
+    three-way mapping stays explicit, but have these two delegate to a
+    shared _read_continuous(file_path, source_format). That also
+    absorbs two of the three _reject_mixed_sampling_rates call sites.
+
+  - the events dict is built in two places. _annotations_to_events
+    returns {onsets, durations, descriptions} or None; read_edf_plus_d
+    builds the identical shape inline from tal_annotations. Same keys,
+    same None-when-empty convention, two sources. If the events
+    contract gains a field, one of them gets forgotten.
+
+Cosmetic (Step 5)
+  - _parse_tals has no return type annotation; every other function does
+  - document the duration default. When a TAL omits its duration we
+    record 0.0, so "duration not relevant" and "duration is explicitly
+    zero" become indistinguishable downstream. Defensible — an
+    instantaneous event is naturally zero-length, and MNE does the same
+    — but it is information loss and it is currently implicit. State it
+    in the docstring so a future reader knows it was a choice.
+  - _uniform_rates names the implementation, not the purpose
+  - _parse_tals reads the header out of file order: it seeks forward to
+    17,752 for samples_per_record, then back to 256 for labels. The
+    order is arbitrary. Reading in file order removes a backwards jump
+    for no cost.
+  - _segment_boundaries returns bare (int, int, float) tuples. The
+    docstring explains them and there is only one call site, so this is
+    low priority, but a NamedTuple would let the fields name themselves.
+
+  - the record onset list has three names for one thing. _parse_tals
+    builds it as record_onsets, read_edf_plus_d receives it as
+    tal_onsets, _segment_boundaries takes it as tal_onsets. Pick one —
+    record_onsets is the more accurate, since the values are record
+    start times and TAL is only how they are stored. Then the list can
+    be grepped and followed across the three functions.
+
+  - _segment_boundaries names carry no hint of WHICH TIMELINE a value
+    lives in, which is the genuinely hard thing about the function.
+    expected_onset is wall-clock seconds; start_samp is a position in
+    MNE's gap-stripped array. Two coordinate systems, distinguished
+    only by a suffix the reader has to infer. The docstring should
+    state the two-timeline idea up front, not bury it in the last line.
+
+    Specific renames:
+        tolerance          -> gap_threshold      (says what it decides)
+        seg_start_record   -> segment_start_record
+        start_samp         -> start_sample
+        stop_samp          -> stop_sample
+        i                  -> record             (it is a record index)
+    expected_onset and actual_onset are already clear; leave them.
+
+    Most of this becomes moot if the two-phase restructure under Step 4
+    lands first, since seg_start_record and n_records_in_seg disappear.
+    Do the restructure first, then rename what is left.
+  - _segment_boundaries docstring should state plainly why the sample
+    arithmetic is simple multiplication: MNE returns EDF+D data with
+    the gaps already stripped, so record k always lands at sample
+    k * samples_per_record regardless of gaps. That is the least
+    obvious thing about the function and it is currently only hinted at.
+  - detect_edf_subtype uses `"EDF+D" in reserved`. Spec 2.1.1 requires
+    the reserved field to START with the identifier, so
+    `reserved.startswith("EDF+D")` after strip() is more faithful.
+    Same reasoning as tightening the annotation label test.
+  - _uniform_rates is only correct because _reject_mixed_sampling_rates
+    ran first, and nothing in the function says so. State the
+    precondition in its docstring; the coupling is invisible at the
+    point where it matters.
+  - _channel_units hardcodes 107 and 201. Those are MNE FIFF constants
+    (FIFF_UNIT_V, FIFF_UNIT_T), not EDF values. Whatever this function
+    becomes after the units decision, the numbers need naming or
+    sourcing from MNE rather than sitting bare in a comparison.
+  - _build_metadata uses .get(key, None); None is already .get's
+    default. Harmless, just noise.
+  - _channel_units duplicates _extract_channel_units in
+    _readers_brainvision.py, and _uniform_rates duplicates an inline
+    np.full(...) at _readers_brainvision.py:66. Three copies of two
+    ideas across two files. Check whether they can genuinely share, or
+    whether the formats differ enough to justify separate versions.
+
+  Magic numbers that all trace back to the EDF spec. Each should be a
+  named constant or carry a comment citing the spec, so a reader does
+  not need to know EDF to follow the code.
+
+    * 2         bytes per sample. EDF has exactly one sample width:
+                spec 2.1.2 "a series of 2-byte samples", and 2.1.3
+                "2-byte two's complement integers, little-endian".
+                There is no header field for it because there is no
+                choice.
+                -> _BYTES_PER_SAMPLE = 2
+
+                CORRECTION to an earlier note here: I had written that
+                this was corroborated by digital min/max being -32768
+                and 32767. That is true of discontinuous.EDF but is
+                NOT general evidence. sub1.edf reports -2048/2047,
+                -2500/2500, -2849/2731 and -2047/2048 — those describe
+                the recorder's ADC range, not the sample width. Digital
+                min/max cannot be used to infer bytes per sample. The
+                2-byte fact rests on the spec alone.
+
+    256         size of the fixed header, and also the size of each
+                signal's header block.
+                -> _FIXED_HEADER_BYTES / _SIGNAL_HEADER_BYTES
+
+    216         offset within the signal headers to the
+                samples-per-record field block. It is the summed width
+                of every earlier field: 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80.
+                Least obvious number in the file; needs the arithmetic
+                spelled out in a comment.
+
+    192/236/    fixed-header field offsets. Documented in the
+    244/252     _read_record_params docstring but used bare in
+                _parse_tals and _channel_sampling_rates. Should be
+                stated once, in whatever the Step 4 header reader
+                becomes.
+
+
+EVIDENCE — measured gap structure of discontinuous.EDF
+
+  Produced by gap_check.py, a throwaway script written deliberately
+  independent of _readers_edf.py: it opens the file with plain
+  open()/seek() and re-derives everything from the bytes, so agreement
+  is corroboration rather than the module confirming itself.
+
+    signals                  81
+    annotation channels      [80]        exactly one
+    records declared         16246
+    onsets parsed            16246       one per record, none skipped
+    record duration          0.25 s
+    samples/record (header)  256
+
+    consecutive pairs        16245
+    exactly contiguous       16239       deviation == 0.0 exactly
+    non-contiguous pairs         6
+
+    the six gap deviations, in seconds:
+       4188.398438
+       8503.812500
+      12111.250000
+      13977.328125
+      17937.460938
+      18350.343750
+
+    segments detected, by tolerance:
+      0.25 x record_duration = 0.0625 s  ->  7
+      0.50 x record_duration = 0.1250 s  ->  7
+      0.75 x record_duration = 0.1875 s  ->  7
+      1.00 x record_duration = 0.2500 s  ->  7
+      1.50 x record_duration = 0.3750 s  ->  7   <- current code
+      2.00 x record_duration = 0.5000 s  ->  7
+
+  What this establishes:
+
+    1. Contiguous records deviate by EXACTLY zero, not approximately
+       zero. There is no floating-point noise for a tolerance to
+       absorb in this file, because the onsets are dyadic rationals
+       and exact in float64. A tolerance should still exist for files
+       whose writers round their onsets, but it is not doing that job
+       here.
+
+    2. The smallest real gap is ~70 minutes and the largest ~5 hours.
+       Five orders of magnitude separate "contiguous" from "gap", which
+       is why the segment count is completely insensitive to the
+       threshold. The 1.5 multiplier is arbitrary, not tuned.
+
+    3. Six gaps produce seven segments, matching
+       reference_segments/segment_0001..0007 — edfplusdcnv's own
+       answer, from an independent implementation.
+
+    4. Every record yielded a parseable time-keeping TAL, so the
+       len(record_onsets) == n_records assertion logged in
+       known_issues.txt would pass on this file.
+
+    5. An independently written parser agrees with _parse_tals on all
+       16,246 onsets.
+
+  gap_check.py has been deleted. Its findings are the numbers above.
+  The tolerance question it was written to answer is settled, and
+  verification of the Step 4 restructure is the test suite's job — the
+  suite must still produce 7 segments matching reference_segments.
+
+
+EVIDENCE — units, header vs what we report
+
+  Produced by unit_check.py. Reads the 8-byte physical dimension field
+  from each signal header and compares it against MNE's unit code and
+  against what _channel_units() returns.
+
+    discontinuous.EDF
+      signals in header      81
+      channels from MNE      80        <- annotation channel dropped
+      header phys dimension  uV x80, blank x1
+      MNE unit codes         107 x80
+      digital min            -32768 x81
+      digital max             32767 x81
+      _channel_units gives   V x80
+
+    sub1.edf
+      signals in header       7
+      channels from MNE       7        <- no annotation channel
+      header phys dimension  uV x4, blank x2, DegC x1
+      MNE unit codes         107 x7
+      digital min            -2048 x4, -2500, -2849, -2047
+      digital max             2047 x4,  2500,  2731,  2048
+      _channel_units gives   V x7
+
+      per channel:
+        EEG Fpz-Cz      uV     -> V
+        EEG Pz-Oz       uV     -> V
+        EOG horizontal  uV     -> V
+        Resp oro-nasal  blank  -> V
+        EMG submental   uV     -> V
+        Temp rectal     DegC   -> V     <- temperature labelled voltage
+        Event marker    blank  -> V
+
+  What this establishes:
+
+    1. MNE assigns unit code 107 to every EDF channel regardless of the
+       header's physical dimension, so _channel_units always takes its
+       first branch. The other two branches cannot execute for EDF.
+
+    2. "V" is nonetheless correct for every file we accept, because
+       those files are all-uV EEG and MNE rescales uV to V. Correct by
+       accident.
+
+    3. A non-voltage channel is silently relabelled. Only occurs in
+       sub1.edf, which the mixed-rate guard already refuses.
+
+    4. Header signal count and MNE channel count differ by the number
+       of annotation channels. See the TRAP note under Step 4.
+
+    5. Digital min/max is NOT evidence for 2 bytes per sample.
+       discontinuous.EDF happens to use the full signed 16-bit range;
+       sub1.edf does not. See the correction under Step 5.
+
+  unit_check.py has been deleted. Its findings are the table above and
+  known_issues.txt item 4.
+
+
+STATUS
+  Step 0  DONE. Baseline:
+            pytest tests/ -q -p no:warnings -k "Synthetic or Errors or RealEDF"
+            35 passed, 2 skipped, 5 deselected, 23:44
+
+          The 2 skips are the mixed-rate files. The 5 deselected are
+          BrainVision (different reader file, irrelevant here) and the
+          loader real-data tests, which ingest the same three files
+          already covered by RealEDFC and RealEDFD. Baseline reflects
+          state after the mixed-rate guard was added.
+
+  Step 1  DONE. Removed: import re, import struct, _parse_tal_onsets.
+          All three verified unreferenced by grep across the repo
+          before deletion. Verified: 27 passed.
+
+  Step 2  IN PROGRESS. Read and mapped so far:
+            EDF byte layout, checked against the published spec
+            read_edf_plus_d orchestration
+            _read_record_params
+            _channel_sampling_rates / _reject_mixed_sampling_rates
+            _parse_tals, every seek and read, plus TAL byte parsing
+            _segment_boundaries, including the measurement above
+            _channel_units, _uniform_rates, _build_metadata,
+            _annotations_to_events
+            detect_edf_subtype, read_edf, read_edf_plus_c
+
+  Step 2  DONE. The whole file has been read and mapped. Two
+          measurements taken along the way, both recorded under
+          EVIDENCE: the gap structure of discontinuous.EDF, and header
+          units vs what we report.
+
+          Throwaway diagnostics gap_check.py and unit_check.py deleted;
+          their findings are the EVIDENCE sections.
+
+          tal_reference.txt written as a standalone explanation of the
+          annotation block — where it sits, how it is sized, and the
+          byte format of a TAL. To be folded into the module docstring
+          in Step 5 so it survives this file being deleted.
+
+  Step 3  IN PROGRESS. 1 of 4 items done.
+
+          [done] annotation multiplicity + exact label match.
+                 Verified 27 passed.
+
+          [todo] delete `tal == b"\x00"`. Unreachable: split consumes
+                 its separators, so no returned piece can contain a
+                 \x00, let alone be one. `not tal` already covers the
+                 case it was aiming at.
+
+          [todo] delete `not parts`. Unreachable: bytes.split() always
+                 returns at least one element, so only `not parts[0]`
+                 can ever fire.
+
+          [todo] tolerance record_duration * 1.5 -> * 0.5. Measured
+                 irrelevant on real data (see EVIDENCE); the change
+                 exists to make the docstring true and to make a
+                 single missing record detectable.
+
+  Found during Step 0, unrelated to cleanup:
+    sub1.edf and sub2.edf are PhysioNet Sleep-EDF recordings with
+    mixed per-channel sampling rates (3 ch at 100 Hz, 4 ch at 1 Hz).
+    MNE cannot return these faithfully in either preload mode, so
+    ingest is currently incorrect for such files. Written up as
+    known_issues.txt item 1. TestRealEDF now detects mixed rates and
+    marks those files xfail, giving a clean baseline without hiding
+    the problem. To be addressed after the cleanup, as its own task.
+
+    Confirmed NOT a schema regression: annotated.edf passed a full
+    sample-by-sample comparison after the _schema.py refactor.
