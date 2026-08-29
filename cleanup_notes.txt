@@ -221,17 +221,53 @@ Structural (Step 4)
       derived: signal_sizes, record_size,
                annotation channel index, per-channel sampling rates
 
-    What it fixes:
-      - header currently read three times per EDF+D ingest
-        (_channel_sampling_rates, _read_record_params, _parse_tals),
-        three file opens for overlapping bytes
-      - labels, samples_per_record, duration and ns each parsed twice
-      - "which signal is the annotation channel" answered in two
-        places with two different multiplicity rules
-      - makes _reject_mixed_sampling_rates a pure function on the
-        object with no file I/O, so it becomes trivially testable
-      - gives record_size a home, which the truncation check in
-        known_issues item 3 needs
+    What it fixes, strongest reason first:
+
+      - FIVE functions currently encode EDF header layout:
+
+            offset 192              detect_edf_subtype
+            offset 236              _read_record_params
+            offset 244              _channel_sampling_rates
+            offset 252              _parse_tals
+            offset 256              _channel_sampling_rates, _parse_tals
+            256 + 216 * n_signals   _channel_sampling_rates, _parse_tals
+
+        Five places that must agree about where fields live and what 216
+        means. If one is wrong, only that path is wrong — a bug visible
+        in the rate check but not in TAL parsing, or the reverse. We
+        already hit exactly this once: annotation detection was done two
+        different ways in two places, with different multiplicity rules.
+        Fixed in Step 3, but the structure that allowed it is still here.
+
+        This is also the only sane home for the spec citations — the 216
+        arithmetic, two-bytes-per-sample, the field offsets.
+
+      - makes _reject_mixed_sampling_rates a pure function on the object
+        with no file I/O. Today testing it means writing an EDF file;
+        after, you construct a header in three lines and assert the
+        guard fires. That is the difference between a test that gets
+        written and one that does not.
+
+      - gives record_size a home. It currently exists only as a local
+        inside _parse_tals, and header_size + n_records * record_size is
+        the whole truncation check from known_issues item 3.
+
+      - labels, samples_per_record, duration and n_signals each parsed
+        two or three times.
+
+      - fewer file opens, from 5 to 4 per EDF+D ingest. Listed last
+        deliberately: it is 20 KB and the least important of these.
+
+    HONEST DOWNSIDE: this is the largest change in the cleanup, touches
+    every function in the file, and is behaviour-neutral — so the test
+    suite is the only thing confirming it is right. There is also a mild
+    indirection cost: today you read _parse_tals and see
+    fh.seek(256 + 216 * n_signals) in place; afterwards you see
+    header.signal_samples and must look elsewhere for its origin.
+
+    Worth taking, because header.signal_samples NAMES the thing while
+    256 + 216 * n_signals requires knowing EDF to read the line at all.
+    Indirection that names is not indirection that hides.
 
     TRAP TO DESIGN AROUND — header signals != MNE channels.
       Measured on discontinuous.EDF: 81 signals in the header, 80
@@ -250,19 +286,48 @@ Structural (Step 4)
 
     DESIGN AS OF END OF DAY 2 — settled points and open ones.
 
-    SETTLED: detect_edf_subtype stays standalone, and each reader builds
-    its own header object.
+    OPEN, MILD PREFERENCE ONLY: whether detect_edf_subtype stays
+    standalone with each reader building its own header, or the
+    dispatcher reads the header once and passes it in.
 
-      Checked _dispatcher.py. All readers, EDF and BrainVision alike,
-      are called through one uniform signature:
+      I first wrote this up as settled, on the grounds that passing a
+      header would "break" the dispatcher's uniform call signature. That
+      was overstated and the note is corrected here. Nothing breaks. The
+      entire difference:
 
-          reader = _EDF_READERS[subtype]      # or _EXTENSION_MAP[ext]
+          # today
+          if extension == ".edf":
+              subtype = detect_edf_subtype(str(source))
+              reader = _EDF_READERS[subtype]
+          elif extension in _EXTENSION_MAP:
+              reader = _EXTENSION_MAP[extension]
           data = reader(str(source))
 
-      Adding a `header` parameter to the EDF readers would break that
-      uniformity, and the dispatcher's documented extension model
-      depends on it ("write an isolated reader function, register it in
-      the map"). Not worth trading for one 44-byte read.
+          # if the header were passed in
+          if extension == ".edf":
+              header = _read_edf_header(str(source))
+              data = _EDF_READERS[header.subtype](str(source), header)
+          elif extension in _EXTENSION_MAP:
+              data = _EXTENSION_MAP[extension](str(source))
+
+      One uniform call splits into two branches. That is the whole cost.
+
+      My "keeps the dispatcher format-agnostic" argument is also weaker
+      than it sounded: the dispatcher ALREADY has an explicit .edf branch
+      calling detect_edf_subtype, because EDF is the only format needing
+      sub-dispatch. Passing a header through that same branch is not new
+      coupling, just more of the same.
+
+      And there is a real point in favour of passing it in that I
+      underweighted: subtype IS a header field, bytes 192-235. Opening
+      the file for those 44 bytes when we are about to open it again for
+      the 20 KB containing them is redundant, and header.subtype is more
+      honest than detect_edf_subtype(path).
+
+      Mild preference remains for each reader building its own, because
+      read_edf_plus_d(path) stays callable standalone and _EDF_READERS
+      stays a plain dict. But it is a preference, it is trivially
+      reversible, and it should not gate the work. Decide when writing.
 
       Result: 5 file opens per EDF+D ingest becomes 1 subtype read plus
       1 header read. The five today:
@@ -392,6 +457,35 @@ Structural (Step 4)
       per-channel native rates at all. That is the one item crossing
       into expensive territory, which is why it stays a separate
       deliberate task rather than part of cleanup.
+
+      TO BE CLEAR ABOUT WHAT MNE GETS WRONG: nothing, at the parsing
+      level. Every failure we found is normalization, not mis-parsing.
+
+          per-channel samples_per_record  read right, then resampled to
+                                          one rate
+          physical dimension strings      read right, then mapped to one
+                                          FIFF unit code
+          annotations                     read right, then filtered to
+                                          MNE's own timeline
+          record start times              read right, then discarded
+                                          when gaps are stripped
+
+      In each case MNE got the bytes correct and then dropped whatever
+      does not fit its model — a single rectangular array at one rate in
+      one unit family. That model is right for an analysis library, which
+      is what MNE is. We are doing archival, so we need precisely the
+      things it discards.
+
+      So MNE is not answering the question badly. It is answering a
+      different question. And the two header parses, ours and MNE's, are
+      not redundancy to remove: they are two consumers with different
+      needs, MNE wanting offsets and calibration to fetch samples, us
+      wanting the per-channel facts it normalizes away.
+
+      Strongest evidence MNE reads correctly: edfplusdcnv, written by the
+      EDF authors, split discontinuous.EDF into 7 segments, and our
+      pipeline reading through MNE agrees. Cross-implementation
+      agreement, not self-consistency.
 
   Remaining, not absorbed by the above
   - _parse_tals would still do two jobs after the header work moves
@@ -925,7 +1019,27 @@ STATUS
                      deviate by exactly 0.0 -> 7 segments either way
                  Verified 27 passed.
 
-  Step 4  IN PROGRESS. 3 of 7 items done, each verified 27 passed.
+  Step 4  IN PROGRESS. 3 of 7 items done, each verified 27 passed, and
+          the whole day's work then confirmed on real data:
+
+            pytest -k "Synthetic or Errors or RealEDF"
+            35 passed, 2 skipped, 5 deselected in 1351.90s
+
+          Same counts as the Step 0 baseline (1424.42s) and as the
+          end-of-day-1 run (1502.44s). Time differences are machine
+          variance.
+
+          This run matters more than the 27-test ones for today's work.
+          The real EDF+D test compares segment output against
+          reference_segments/segment_0001..0007, produced by edfplusdcnv,
+          so the _segment_boundaries restructure is checked against an
+          independent implementation rather than against a 5-record
+          synthetic fixture.
+
+          Run deliberately at end of day rather than deferred to Step 6,
+          so that if the header reader causes a failure tomorrow there is
+          no ambiguity about whether today's restructure or tomorrow's
+          refactor was responsible.
 
           [done] item 3, rstrip the annotation block before splitting.
                  Also corrected the comment on the surviving `not tal`
