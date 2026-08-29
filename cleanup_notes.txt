@@ -13,6 +13,48 @@ METHOD
 Rule: never mix a logic change with a cosmetic change in one step.
 
 
+STANDARD TO HOLD THE REST OF THIS WORK TO
+
+  Derived from the item 4 change, which replaced cursor tracking with a
+  computed position. Use it as the yardstick for the remaining edits.
+
+  1. Prefer computing over tracking.
+     Before, each record's position depended on where the previous read
+     left the cursor, so one short read would misalign everything after
+     it. After, each position is computed from the header, so a failure
+     is confined to the record it happens in. State that spans
+     iterations is where drift hides.
+
+  2. Reuse existing vocabulary before inventing any.
+     The first draft introduced first_annot_pos, an absolute file
+     position, sitting next to annot_offset_in_record, an offset within
+     a record. Two similar names for different kinds of offset. Keeping
+     record_start — already in the file, already correct — removed the
+     new name entirely and shrank the diff. Ask whether a new concept is
+     actually needed before naming one.
+
+  3. Match the local convention when it is reasonable.
+     record_idx rather than record, record_i or i, because the loop
+     directly inside it is already `for tal_idx, tal in ...`. Bare nouns
+     imply iterating over objects; we are iterating over indices, so the
+     _idx suffix is both correct and consistent.
+
+  4. Arithmetic should read as a sentence.
+     header_size + record_idx * record_size + annot_offset_in_record
+     reads as: start of the data, N record-lengths in, then this far
+     into the record. If the expression cannot be read aloud, the names
+     are wrong.
+
+  5. Comments carry WHY, never WHAT.
+     "Every data record has identical layout, so a record's position can
+     be computed rather than tracked" states a fact about EDF that
+     licenses the arithmetic and is not visible from the code. A comment
+     restating what a name means is a sign the name failed.
+
+  Vocabulary belongs in the module docstring, not in scattered comments:
+  signal vs channel, the byte layout, the two timelines.
+
+
 PRELIMINARY FINDINGS
 
 Provably safe to delete (Step 1)
@@ -206,8 +248,96 @@ Structural (Step 4)
       is unmistakable. Decide this before writing the dataclass, not
       after.
 
-    Form: small frozen dataclass reads best. NamedTuple or dict also
-    viable. Decide when implementing.
+    DESIGN AS OF END OF DAY 2 — settled points and open ones.
+
+    SETTLED: detect_edf_subtype stays standalone, and each reader builds
+    its own header object.
+
+      Checked _dispatcher.py. All readers, EDF and BrainVision alike,
+      are called through one uniform signature:
+
+          reader = _EDF_READERS[subtype]      # or _EXTENSION_MAP[ext]
+          data = reader(str(source))
+
+      Adding a `header` parameter to the EDF readers would break that
+      uniformity, and the dispatcher's documented extension model
+      depends on it ("write an isolated reader function, register it in
+      the map"). Not worth trading for one 44-byte read.
+
+      Result: 5 file opens per EDF+D ingest becomes 1 subtype read plus
+      1 header read. The five today:
+
+          detect_edf_subtype        offset 192
+          _channel_sampling_rates   offsets 244, 256, 256+216ns
+          _read_record_params       offset 236
+          _parse_tals               offsets 252, 256, 256+216ns
+          _read_record_params       again, from inside _parse_tals
+
+      n_signals parsed 3x, record_duration 3x, signal_samples 2x,
+      n_records 2x.
+
+    SETTLED: frozen dataclass, not NamedTuple.
+
+      Deliberately different from the Segment NamedTuple added in item
+      2. Segment genuinely IS a tuple of three related coordinates, so
+      unpacking reads naturally and the call site already unpacks it.
+      The header is a record of unrelated facts — `for x in header` is
+      meaningless and accidental positional access would be a silent
+      bug. A frozen dataclass is not iterable, which matches what the
+      thing actually is.
+
+    SETTLED: proposed fields.
+
+      Raw from the header:
+          n_records          int
+          record_duration    float
+          n_signals          int
+          signal_labels      list[str]    all 81, includes annotations
+          signal_samples     list[int]    all 81
+
+      Derived, only where more than one consumer needs it or it encodes
+      a spec rule:
+          header_size        int          256 + 256 * n_signals
+          record_size        int          sum(s * 2 for s in signal_samples)
+          annotation_index   int | None   the single EDF Annotations signal
+          channel_rates      list[float]  ordinary signals only, 80
+
+      signal_sizes deliberately left OUT. _parse_tals is its only
+      consumer and can derive its offsets from signal_samples directly.
+      Principle 2 — do not invent a concept that one caller can compute.
+
+    SETTLED: scope is parse only. Validation lands as a separate edit
+    immediately after.
+
+      Reason: if the tests move during a change that is supposed to be
+      behaviour-neutral, it must be unambiguous that the refactor caused
+      it and not a newly added check firing. Validation is then small
+      and additive:
+          header_size vs the value declared at offset 184
+          header_size + n_records * record_size vs the file size on disk
+      That is known_issues.txt item 3, which also carries the
+      one-onset-per-record assertion.
+
+    OPEN: where the ordinary-channel samples_per_record lives.
+
+      Item 7 wants _segment_boundaries to use the header's exact integer
+      instead of int(record_duration * sfreq). That value is only
+      well-defined once the mixed-rate guard has passed — before that,
+      "the" samples-per-record for ordinary channels does not exist.
+
+      The guard does run first, so nobody can read a meaningless value,
+      but the field would be populated at construction, before the guard
+      fires. Options: store it with a docstring stating the
+      precondition, or make it a property that raises when rates are not
+      uniform.
+
+      Lean: store it plainly. The invisible-precondition pattern is
+      already what _uniform_rates does, and we logged that as something
+      to STATE rather than engineer around. Consistency argues for the
+      same treatment here.
+
+      Name would be channel_samples_per_record under the signal_ /
+      channel_ convention. Long but unambiguous.
 
     NAMING MUST BE STATED, NOT JUST FOLLOWED.
       A signal_* / channel_* prefix convention is only useful if a
@@ -456,6 +586,21 @@ Structural (Step 4)
     contract gains a field, one of them gets forgotten.
 
 Cosmetic (Step 5)
+  - decide on abbreviations and apply one rule throughout. The file
+    currently mixes both: annot_idx, annot_offset_in_record, annot_bytes,
+    annot_data, annot_indices use the short form, while `annotations`
+    and _annotations_to_events spell it out. There is an accidental
+    logic to it — annot_ for byte-level plumbing, annotations for the
+    parsed result — but it was not chosen deliberately.
+
+    Preference is to spell it out, since the file is short enough that
+    the extra characters cost nothing and a maintainer should not have
+    to learn a private shorthand. Whole-file rename, so it belongs here
+    rather than mid-edit.
+
+    Same question for any pos/position, idx/index pairs. Whatever is
+    chosen, apply it everywhere rather than per-function.
+
   - _parse_tals has no return type annotation; every other function does
   - document the duration default. When a TAL omits its duration we
     record 0.0, so "duration not relevant" and "duration is explicitly
@@ -478,6 +623,27 @@ Cosmetic (Step 5)
     record_onsets is the more accurate, since the values are record
     start times and TAL is only how they are stored. Then the list can
     be grepped and followed across the three functions.
+
+    This is not a preference, it has cost reading time twice. The name
+    describes where the values came from (a TAL) rather than what they
+    are (record start times), and it says nothing about the index, which
+    is half of what the list is for:
+
+        value at index N  =  when record N starts
+        index             =  a record number
+        len(...)          =  the record count
+
+    _segment_boundaries relies on both halves. The same integer is
+    multiplied by samples_per_record to get a sample position AND used
+    to index the list to get a wall-clock time — that integer is the
+    bridge between the two timelines. record_onsets carries both
+    meanings; tal_onsets carries neither.
+
+    Three touch points, mechanical:
+        _segment_boundaries   parameter and its body
+        read_edf_plus_d       the local variable it unpacks into
+        _parse_tals           already calls it record_onsets internally,
+                              so no change needed there
 
   - _segment_boundaries names carry no hint of WHICH TIMELINE a value
     lives in, which is the genuinely hard thing about the function.
@@ -720,24 +886,88 @@ STATUS
           byte format of a TAL. To be folded into the module docstring
           in Step 5 so it survives this file being deleted.
 
-  Step 3  IN PROGRESS. 1 of 4 items done.
+  Step 3  DONE. All 4 items, in three verified edits.
 
           [done] annotation multiplicity + exact label match.
+                 Verified 27 passed, then 35 passed / 2 skipped on the
+                 full real-data run.
+
+          [done] deleted `tal == b"\x00"` and `not parts`, one edit.
+                 Both provably unreachable: split consumes its
+                 separators so no piece can be b"\x00", and
+                 bytes.split() always returns at least one element.
+                 A one-line comment was added explaining why the
+                 surviving `not tal` exists, since the deletion left it
+                 looking unmotivated. Verified 27 passed.
+
+          [done] tolerance record_duration * 1.5 -> * 0.5, together
+                 with the docstring sentence it contradicted.
+
+                 The old docstring claimed a gap was a jump of "more
+                 than one record duration". That was never true of 1.5
+                 and is not true of 0.5 either, so the sentence was
+                 rewritten to what the code does: a record beginning
+                 more than half a record duration after the previous
+                 one ended starts a new segment.
+
+                 Effect: a single missing record is now detected.
+                 Deviation for one missing record is exactly one record
+                 duration, which cleared 0.375 under the old threshold
+                 and is caught by 0.125 under the new one.
+
+                 Inert on all available data, checked both ways:
+                   synthetic fixture, 1 s records, onsets
+                     0.0 1.0 5.0 6.0 10.0
+                     both gaps deviate by 3.0, detected under either
+                     threshold -> 3 segments either way
+                   discontinuous.EDF
+                     six gaps of 4188 s to 18350 s, contiguous records
+                     deviate by exactly 0.0 -> 7 segments either way
                  Verified 27 passed.
 
-          [todo] delete `tal == b"\x00"`. Unreachable: split consumes
-                 its separators, so no returned piece can contain a
-                 \x00, let alone be one. `not tal` already covers the
-                 case it was aiming at.
+  Step 4  IN PROGRESS. 3 of 7 items done, each verified 27 passed.
 
-          [todo] delete `not parts`. Unreachable: bytes.split() always
-                 returns at least one element, so only `not parts[0]`
-                 can ever fire.
+          [done] item 3, rstrip the annotation block before splitting.
+                 Also corrected the comment on the surviving `not tal`
+                 guard, which the rstrip made inaccurate.
 
-          [todo] tolerance record_duration * 1.5 -> * 0.5. Measured
-                 irrelevant on real data (see EVIDENCE); the change
-                 exists to make the docstring true and to make a
-                 single missing record detectable.
+          [done] item 4, compute record positions instead of tracking
+                 the cursor. Kept record_start, which was already in the
+                 file and already meant the right thing, so the change
+                 introduced only one new name (record_idx, matching the
+                 tal_idx directly inside it). This is the change the
+                 STANDARD section above was derived from.
+
+          [done] item 2, _segment_boundaries option A restructure, plus
+                 the Segment NamedTuple.
+
+                 n_records_in_seg removed — record_idx *
+                 samples_per_record already IS the stop position.
+                 start_samp / stop_samp gone as variables, inlined.
+                 Condition inverted with continue to unnest the body.
+                 Comment added stating where the gap sits.
+                 tolerance -> gap_threshold, seg_start_record ->
+                 segment_start_record, i -> record_idx.
+
+                 The Segment NamedTuple was moved from "orthogonal" to
+                 part of this edit. Reason: without it the append is
+                 three bare values whose meaning lives only in the
+                 docstring, so the restructure would have been shorter
+                 without being readable. Costs nothing at the call site
+                 because a NamedTuple unpacks like a tuple, so
+                 read_edf_plus_d needed no change.
+
+                 In-function renames were folded in rather than left for
+                 Step 5, since the whole body was being rewritten and
+                 doing it twice would gain no diff attribution. The
+                 cross-function tal_onsets -> record_onsets rename was
+                 NOT folded in and remains a Step 5 item.
+
+          [todo] items 1 + 7, the header reader. Needs a design
+                 conversation before any code.
+
+          [todo] items 5 and 6, reader-level dedup. After the header
+                 reader, since it reshapes the same functions.
 
   Found during Step 0, unrelated to cleanup:
     sub1.edf and sub2.edf are PhysioNet Sleep-EDF recordings with

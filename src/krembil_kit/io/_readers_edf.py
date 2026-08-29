@@ -24,7 +24,22 @@ read individually from disk.
 import numpy as np
 import mne
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, NamedTuple, Tuple
+
+
+class Segment(NamedTuple):
+    """
+    One continuous stretch of an EDF+D recording.
+
+    start_sample and stop_sample index MNE's concatenated data, which
+    has the gaps already removed, with stop exclusive. onset is the
+    wall-clock time of the segment's first record and is the only
+    real-time information that survives the gap stripping.
+    """
+
+    start_sample: int
+    stop_sample: int
+    onset: float
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -278,24 +293,29 @@ def _parse_tals(file_path: str):
         record_onsets = []
         annotations = []
 
-        fh.seek(header_size)
-        for _ in range(n_records):
-            record_start = fh.tell()
+        # Every data record has identical layout, so a record's position
+        # can be computed rather than tracked with tell().
+        for record_idx in range(n_records):
+            record_start = header_size + record_idx * record_size
             fh.seek(record_start + annot_offset_in_record)
             annot_data = fh.read(annot_bytes)
-            fh.seek(record_start + record_size)
 
-            # Split into individual TALs (separated by \x00)
-            tals = annot_data.split(b"\x00")
+            # TALs are packed at the front of the block and separated by
+            # \x00, with the remaining bytes zero-filled. Dropping the
+            # trailing zeros first keeps the split from producing one
+            # empty piece per padding byte.
+            tals = annot_data.rstrip(b"\x00").split(b"\x00")
 
             for tal_idx, tal in enumerate(tals):
-                if not tal or tal == b"\x00":
+                # A record whose block holds no TALs at all rstrips to
+                # b"" and yields a single empty piece.
+                if not tal:
                     continue
 
                 # Parse TAL: +<onset>(\x15<duration>)?\x14(<text>\x14)*
                 # Split on \x14 to get [onset_part, text1, text2, ...]
                 parts = tal.split(b"\x14")
-                if not parts or not parts[0]:
+                if not parts[0]:
                     continue
 
                 onset_part = parts[0]
@@ -340,43 +360,49 @@ def _segment_boundaries(
     record_duration: float,
     sfreq: float,
     n_records: int,
-) -> List[Tuple[int, int, float]]:
+) -> List[Segment]:
     """
-    Given per-record TAL onsets, identify continuous segments by
-    detecting where consecutive onsets jump by more than one record
-    duration (indicating a gap).
+    Given per-record TAL onsets, identify continuous segments. A record
+    that begins more than half a record duration later than the
+    previous record ended is treated as starting a new segment.
 
-    Returns (start_sample, stop_sample, onset_time) tuples.
-    Sample indices are relative to MNE's concatenated data (gaps
-    stripped). onset_time is the absolute TAL time of the segment's
-    first record.
+    Records appear in the file in chronological order (EDF+ spec 2.1.2),
+    so comparing each onset against the previous one is enough to find
+    every gap.
     """
     if not tal_onsets:
-        return [(0, int(n_records * record_duration * sfreq), 0.0)]
+        return [Segment(0, int(n_records * record_duration * sfreq), 0.0)]
 
-    tolerance = record_duration * 1.5
+    gap_threshold = record_duration * 0.5
     samples_per_record = int(record_duration * sfreq)
 
     segments = []
-    seg_start_record = 0
+    segment_start_record = 0
 
-    for i in range(1, len(tal_onsets)):
-        expected_onset = tal_onsets[i - 1] + record_duration
-        actual_onset = tal_onsets[i]
+    for record_idx in range(1, len(tal_onsets)):
+        expected_onset = tal_onsets[record_idx - 1] + record_duration
+        actual_onset = tal_onsets[record_idx]
 
-        if abs(actual_onset - expected_onset) > tolerance:
-            # Gap detected between record i-1 and record i.
-            n_records_in_seg = i - seg_start_record
-            start_samp = seg_start_record * samples_per_record
-            stop_samp = start_samp + n_records_in_seg * samples_per_record
-            segments.append((start_samp, stop_samp, tal_onsets[seg_start_record]))
-            seg_start_record = i
+        if abs(actual_onset - expected_onset) <= gap_threshold:
+            continue
 
-    # Final segment.
-    n_records_in_seg = len(tal_onsets) - seg_start_record
-    start_samp = seg_start_record * samples_per_record
-    stop_samp = start_samp + n_records_in_seg * samples_per_record
-    segments.append((start_samp, stop_samp, tal_onsets[seg_start_record]))
+        # The gap sits between record_idx-1 and record_idx, so the
+        # segment being built ends at record_idx-1 and the next one
+        # begins at record_idx.
+        segments.append(Segment(
+            start_sample=segment_start_record * samples_per_record,
+            stop_sample=record_idx * samples_per_record,
+            onset=tal_onsets[segment_start_record],
+        ))
+        segment_start_record = record_idx
+
+    # No gap follows the last record, so the final segment is closed
+    # against the end of the list rather than by a detected gap.
+    segments.append(Segment(
+        start_sample=segment_start_record * samples_per_record,
+        stop_sample=len(tal_onsets) * samples_per_record,
+        onset=tal_onsets[segment_start_record],
+    ))
 
     return segments
 
