@@ -17,7 +17,7 @@ import pytest
 from pathlib import Path
 
 from krembil_kit.io import ingest, SCHEMA_VERSION
-from krembil_kit.io._readers_edf import _channel_sampling_rates
+from krembil_kit.io._readers_edf import _read_header
 from conftest import (
     DATA_DIR, require_file, require_dir,
     create_synthetic_edf, create_synthetic_edfd,
@@ -244,7 +244,7 @@ _edf_files = sorted(EDF_DIR.glob("*.edf")) if EDF_DIR.is_dir() else []
 
 def _has_mixed_rates(path):
     """True if the file's channels do not share one sampling rate."""
-    return len(set(_channel_sampling_rates(str(path)))) > 1
+    return len(set(_read_header(str(path)).channel_rates)) > 1
 
 
 class TestRealEDF:

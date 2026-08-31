@@ -45,6 +45,42 @@ STANDARD TO HOLD THE REST OF THIS WORK TO
      into the record. If the expression cannot be read aloud, the names
      are wrong.
 
+  5a. Name the numbers that hide a CONCEPT. Leave the ones that are
+      just a WIDTH.
+
+      Refined while writing _read_header, and it contradicts the earlier
+      blanket "extract the magic numbers" note further down.
+
+      LEAVE BARE — field widths and offsets, where the variable name
+      already says what is being read and the docstring table gives the
+      layout:
+
+          fh.seek(236)
+          n_records = int(fh.read(8)...)
+          record_duration = float(fh.read(8)...)
+          n_signals = int(fh.read(4)...)
+
+      Naming these as _N_RECORDS_BYTES and so on adds noise AND hides
+      the thing that matters, which is that 8 + 8 + 4 lands exactly on
+      256 where the labels begin.
+
+      DO NAME — numbers carrying a concept the line does not state:
+
+          header_size = 256 + 256 * n_signals
+
+      Those two 256s are DIFFERENT THINGS that happen to be equal: the
+      fixed header size, and one signal's header block size. Nothing in
+      the line says so.
+
+          header_size = _FIXED_HEADER_BYTES + _SIGNAL_HEADER_BYTES * n_signals
+
+      Likewise _BYTES_PER_SAMPLE for the `* 2`, and for 216 express it
+      as its own arithmetic so it can be checked against the table
+      without mental addition:
+
+          # Width of every signal-header field preceding samples-per-record.
+          _SAMPLES_FIELD_OFFSET = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80   # 216
+
   5. Comments carry WHY, never WHAT.
      "Every data record has identical layout, so a record's position can
      be computed rather than tracked" states a fact about EDF that
@@ -779,8 +815,70 @@ Cosmetic (Step 5)
   - _channel_units duplicates _extract_channel_units in
     _readers_brainvision.py, and _uniform_rates duplicates an inline
     np.full(...) at _readers_brainvision.py:66. Three copies of two
-    ideas across two files. Check whether they can genuinely share, or
-    whether the formats differ enough to justify separate versions.
+    ideas across two files.
+
+    Resolved into a plan — see MAKING FORMAT ADDITION ITERATIVE below.
+    These belong in a shared module, but only because they are about our
+    OUTPUT contract, not about any input format.
+
+
+MAKING FORMAT ADDITION ITERATIVE
+(beyond the scope of this cleanup, but it is the stated project goal so
+ it is recorded here rather than lost)
+
+  The reader contract already works. Every reader returns the same eight
+  keys and the dispatcher unpacks exactly those into write_hdf5:
+
+      signals               MNE Raw, or list of arrays if discontinuous
+      channel_names         list of str
+      channel_units         list of str
+      sampling_rates        np.ndarray, one per channel
+      events                dict with onsets/durations/descriptions, or None
+      metadata              dict written as attributes
+      discontinuous         bool
+      segment_start_times   list of float, or None
+
+  EDF and BrainVision were written independently and both satisfy it, so
+  this is a working model rather than an aspiration. Two things make it
+  harder than it needs to be.
+
+  1. THE CONTRACT IS NOWHERE WRITTEN DOWN.
+     _dispatcher.py's docstring says "write an isolated reader function,
+     register it in the _EXTENSION_MAP" but never states what the
+     function must return. Anyone adding .set must reverse-engineer the
+     eight keys from an existing reader.
+
+     Fix: a TypedDict in _schema.py, since write_hdf5's parameters ARE
+     the contract. Then readers annotate -> RecordingData and a type
+     checker catches a missing or misnamed key before runtime. Turns an
+     informal convention into a checked one at almost no cost.
+
+  2. THE READERS ALREADY COPY-PASTE FROM EACH OTHER.
+     Unit mapping, events construction, metadata construction and
+     uniform rate arrays are duplicated or near-duplicated between the
+     EDF and BrainVision readers. A third format copies them a third
+     time.
+
+     The line to draw:
+
+       SHARED     anything that translates MNE's view into our contract
+                  channel units, events dict, metadata dict, uniform
+                  rates. These are format-agnostic by nature.
+
+       PER-FORMAT anything about the input format itself
+                  EDF's byte offsets, records and TALs; BrainVision's
+                  tri-file resolution. These must stay isolated so one
+                  format's quirks cannot leak into another.
+
+     That line preserves what "isolated reader" is actually protecting
+     while removing the duplication that has no reason to exist. With
+     the four helpers shared, a .set reader would be roughly: open with
+     MNE, call four helpers, return the dict.
+
+  Note the EdfHeader dataclass is deliberately NOT shared. It parses EDF
+  byte offsets, and BrainVision's header is an INI-style text file MNE
+  reads in full. There is no common header concept to abstract, and
+  inventing one would impose a shape neither format has.
 
   Magic numbers that all trace back to the EDF spec. Each should be a
   named constant or carry a comment citing the spec, so a reader does
@@ -1077,11 +1175,101 @@ STATUS
                  cross-function tal_onsets -> record_onsets rename was
                  NOT folded in and remains a Step 5 item.
 
-          [todo] items 1 + 7, the header reader. Needs a design
-                 conversation before any code.
+          [done] items 1 + 7, the header reader. Split into five
+                 verifiable sub-steps rather than one change, each run
+                 at 27 passed:
 
-          [todo] items 5 and 6, reader-level dedup. After the header
-                 reader, since it reshapes the same functions.
+                 4.1  added EdfHeader (frozen dataclass) and
+                      _read_header(). Nothing called them, so a pure
+                      addition. The full byte layout lives in its
+                      docstring, including 216 = 16+80+8+8+8+8+8+80
+                      spelled out.
+                 4.2  migrated the guard. _channel_sampling_rates
+                      deleted entirely, 25 lines absorbed.
+                      _reject_mixed_sampling_rates(header, file_name)
+                      now does no file I/O. tests/test_ingest.py's
+                      _has_mixed_rates swapped onto _read_header.
+                 4.3  _parse_tals(file_path, header). Lost 30 lines of
+                      header parsing, and now opens the file only after
+                      the annotation lookup, instead of opening it and
+                      possibly returning without reading a byte.
+                 4.4  deleted _read_record_params, and dropped Tuple
+                      from the typing imports since that function's
+                      return annotation was its only use.
+                 4.5  _segment_boundaries(tal_onsets, header). Uses the
+                      header's exact integer instead of
+                      int(record_duration * sfreq), so sfreq disappears
+                      from the function AND from read_edf_plus_d. The
+                      function no longer touches MNE at all — it is now
+                      purely a function of TAL onsets and header facts,
+                      which removes the two-worlds mixing flagged in
+                      Step 2.
+
+                 Also in 4.5, the `if not tal_onsets` fallback became an
+                 explicit refusal rather than returning one segment
+                 covering everything. That branch is unreachable for a
+                 valid EDF+D file, since spec 2.2.1 requires every EDF+
+                 file to carry an 'EDF Annotations' signal precisely so
+                 record start times have somewhere to live. Keeping it
+                 would have meant guarding against None arithmetic for a
+                 case that cannot legally occur. Approved as a
+                 deliberate behaviour change.
+
+          [done] item 5, _read_continuous_recording.
+
+                 read_edf and read_edf_plus_c are now one line each,
+                 naming a format and delegating. Three public readers
+                 kept so the dispatcher's three-way table stays readable;
+                 collapsing it would have needed lambdas or partials in
+                 the map, which reads worse than two one-line wrappers.
+
+                 Named _read_continuous_recording, not _read_continuous.
+                 Two reasons, both raised by RB: the adjective needed a
+                 noun to match _write_continuous_signals in _schema.py,
+                 and "continuous" is a recording-type word while its
+                 callers are named by format — mixing the two axes is
+                 what made the short name feel wrong. The docstring
+                 states outright that there is NO discontinuous
+                 counterpart and why, rather than leaving the asymmetry
+                 as a puzzle.
+
+                 Behaviour change: read_edf no longer hardcodes
+                 events=None, it asks MNE like EDF+C does. Identical for
+                 a compliant plain EDF, which has no annotation channel.
+                 For a file with a blank reserved field that does carry
+                 one, annotations are now kept instead of silently
+                 dropped — a change that can only recover data, never
+                 invent it.
+
+                 Rejected alternative: extracting only the shared
+                 opening as _open_edf() used by all three readers.
+                 Symmetric, but it removes 4 lines per reader while
+                 leaving the eight-key dict duplicated, and adds a
+                 3-tuple for callers to unpack. Fixes less, costs more.
+
+          [done] item 6, _events_dict.
+
+                 The events dict was built in two places — from MNE's
+                 arrays and inline from TAL dicts. What is shared is the
+                 SHAPE, not the conversion, so _events_dict(onsets,
+                 durations, descriptions) now owns the three keys and the
+                 None-when-empty rule. If events ever gain a field there
+                 is one line to change instead of two that can drift.
+
+                 Uses len(onsets) == 0 rather than a truth test, because
+                 MNE returns numpy arrays and the truth value of an empty
+                 array is ambiguous in numpy. len() behaves identically
+                 on arrays and lists, so one function serves both
+                 callers.
+
+                 Also corrected _annotations_to_events' return
+                 annotation, which claimed Dict on a function that can
+                 return None.
+
+  ALL OF STEP 4 DONE. _read_header is now the only function in the file
+  that knows a byte offset, which was the entire point. Both
+  _reject_mixed_sampling_rates and _segment_boundaries became pure
+  functions of header facts, with no file I/O and no MNE dependency.
 
   Found during Step 0, unrelated to cleanup:
     sub1.edf and sub2.edf are PhysioNet Sleep-EDF recordings with

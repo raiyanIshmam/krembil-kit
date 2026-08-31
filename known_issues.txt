@@ -89,6 +89,41 @@ KNOWN ISSUES AND DEFERRED WORK
    Priority: Low-Medium. No known instance yet, but the failure mode is
    silent, which is the kind we most want to eliminate.
 
+   WHERE THESE CHECKS SHOULD LIVE — decided, not yet built.
+
+   The readers should assume a compliant file and stay focused on the
+   normal path. Validation belongs in _read_header, which already runs
+   once per ingest and already parses every field the checks need, so
+   each one is an `if` on data it is holding anyway. Keeping them
+   together there also means they read as a single coherent "what makes
+   this file valid" block rather than being sprinkled through the
+   readers.
+
+   Alongside that, a public function that reports problems without
+   converting anything:
+
+       problems = validate("recording.edf")
+
+   Returning a LIST rather than raising on the first fault, so someone
+   with 200 files learns everything wrong with each in one pass. This is
+   the inspect() idea from item 6 and it is nearly free now that the
+   header reader exists.
+
+   ONE THING THAT MUST NOT BECOME OPTIONAL. There are two kinds of check
+   here and only one can be opt-in:
+
+     silent corruption — mixed sampling rates, several annotation
+       channels. Skip these and you get a complete, plausible HDF5 whose
+       samples were fabricated, or whose segment boundaries are in the
+       wrong places. The file looks fine. These stay mandatory, because
+       an optional check that nobody runs restores exactly the failure
+       mode the guard was written to remove.
+
+     loud failure — truncated files, missing annotation channel, header
+       size cross-check. Skip these and you get a crash or an obviously
+       wrong result, not a trusted archive that is quietly wrong. A crash
+       is recoverable. These can be optional.
+
    Related check, same family: nothing verifies that the TAL walk
    produced one onset per record. If a record yields no parseable
    timestamp, the `continue` skips it and record_onsets ends up shorter
@@ -141,3 +176,37 @@ KNOWN ISSUES AND DEFERRED WORK
    Priority: Low while the guard blocks the only affected file, Medium
    once mixed-rate support lands, because that removes the guard and
    makes DegC channels ingestable.
+
+5. SCHEMA VERSION IS MATCHED EXACTLY, WHICH ORPHANS OLD ARCHIVES
+   _loader.py rejects any file whose schema_version is not identical to
+   the loader's own:
+
+       if version != SCHEMA_VERSION:
+           raise ValueError(f"Unsupported schema version '{version}'...")
+
+   So the day SCHEMA_VERSION becomes "1.1", every file converted under
+   "1.0" stops loading unless the user pins an old release. For a tool
+   whose purpose is archival that is backwards — the format should
+   outlive the code that wrote it.
+
+   Normal practice: accept the same major version, reject across major
+   bumps, and have the loader fill in defaults for fields a newer schema
+   added. That means minor versions must only ever be additive, which is
+   worth stating as a rule now while there is only one version.
+
+   Priority: Medium. Costs nothing today because there is one version,
+   but every converted file is a hostage until it is fixed.
+
+6. INGEST IS SILENT DURING A MULTI-MINUTE OPERATION
+   ingest() on a large file prints nothing while it works. A 645 MB
+   EDF+D takes minutes, and a frozen terminal is indistinguishable from
+   a hang. tqdm is already a declared dependency and the chunk loop in
+   _write_continuous_signals is the natural place for a progress bar.
+
+   Priority: Low technically, Medium for anyone who is not the author.
+
+   Deliberately deferred, along with batch/directory ingestion,
+   skip-existing behaviour for resumable batches, and an inspect()
+   function that reads the header without converting. All are surface
+   gaps rather than design problems. The inspect() one becomes nearly
+   free once the Step 4 header reader exists.
