@@ -173,6 +173,31 @@ KNOWN ISSUES AND DEFERRED WORK
    per-channel facts read from the signal headers instead of inferred
    from MNE.
 
+   CONSIDERED AND REJECTED FOR NOW, same family: replacing
+   _sampling_rates(raw) with np.asarray(header.channel_rates).
+
+   Tempting, because the header rates come from the file rather than
+   MNE's single sfreq, and it would delete a function. Rejected because
+   it trades away a safety property for no observable gain.
+
+     - _sampling_rates derives its length from len(raw.ch_names), so the
+       array is correct by construction however MNE builds that list.
+     - header.channel_rates derives its length from our own filter,
+       label != "EDF Annotations". Correct only while our filter and
+       MNE's agree. They do on all three real files (81->80, 34->33,
+       7->7), but that is three files, and a disagreement would leave
+       /channels/sampling_rates a different length from /channels/names,
+       silently breaking the parallel-array invariant.
+     - the values are identical for every file we accept anyway, since
+       MNE computes sfreq from the same header fields and the mixed-rate
+       guard means there is only one rate.
+
+   This is the 81-vs-80 index-space trap, and the change would be the
+   first place the two spaces meet. It belongs with mixed-rate support,
+   where raw.ch_names cannot describe a ragged recording and the header
+   becomes the only usable source — so the alignment question has to be
+   answered properly there regardless.
+
    Priority: Low while the guard blocks the only affected file, Medium
    once mixed-rate support lands, because that removes the guard and
    makes DegC channels ingestable.
@@ -210,3 +235,58 @@ KNOWN ISSUES AND DEFERRED WORK
    function that reads the header without converting. All are surface
    gaps rather than design problems. The inspect() one becomes nearly
    free once the Step 4 header reader exists.
+
+7. THE READER CONTRACT IS NOT WRITTEN DOWN, AND READERS COPY EACH OTHER
+   Every reader must return the same eight keys, and the dispatcher
+   unpacks exactly those into write_hdf5:
+
+       signals               MNE Raw, or list of arrays if discontinuous
+       channel_names         list of str
+       channel_units         list of str
+       sampling_rates        np.ndarray, one per channel
+       events                dict of onsets/durations/descriptions, or None
+       metadata              dict written as HDF5 attributes
+       discontinuous         bool
+       segment_start_times   list of float, or None
+
+   The EDF and BrainVision readers were written independently and both
+   satisfy this, so the model works. Two things make adding a third
+   format harder than it should be.
+
+   First, nothing states the contract. _dispatcher.py says "write an
+   isolated reader function, register it in the _EXTENSION_MAP" but never
+   says what the function must return, so anyone adding .set has to
+   reverse-engineer the eight keys from an existing reader. A TypedDict in
+   _schema.py would fix this, since write_hdf5's parameters already are
+   the contract. Readers then annotate -> RecordingData and a type checker
+   catches a missing or misnamed key before runtime.
+
+   Second, the readers already duplicate each other. _channel_units in the
+   EDF reader and _extract_channel_units in the BrainVision reader are the
+   same function under different names; the sampling-rate array is a
+   helper in one and an inline np.full in the other; events and metadata
+   construction are near-identical. A third format copies all of it again.
+
+   The line to draw:
+
+     SHARED      anything translating a library's view into our contract —
+                 channel units, events dict, metadata dict, rate arrays.
+                 Format-agnostic by nature.
+     PER-FORMAT  anything about the input format itself — EDF's byte
+                 offsets, records and TALs; BrainVision's tri-file
+                 resolution. These stay isolated so one format's quirks
+                 cannot leak into another.
+
+   That preserves what "isolated reader" actually protects while removing
+   duplication that has no reason to exist. With those helpers shared, a
+   .set reader becomes roughly: open with MNE, call four helpers, return
+   the dict.
+
+   Note the EdfHeader dataclass is deliberately NOT shareable. It parses
+   EDF byte offsets, and BrainVision's header is a text file MNE reads in
+   full. There is no common header concept to abstract, and inventing one
+   would impose a shape neither format has.
+
+   Priority: Medium. Nothing is broken, but this is the difference between
+   adding a format being a bounded task and being an exercise in
+   archaeology.

@@ -50,6 +50,48 @@ pipeline untouched.
   precise starting timestamps. This perfectly preserves the original
   data without introducing massive empty arrays.
 
+5. OUTPUT STRUCTURE AND THE GUARANTEE IT CARRIES
+Every reader produces the same eight pieces of information, so the HDF5
+output is structurally identical regardless of which format it came from:
+
+    /                      attrs: schema_version
+    /signals               attrs: discontinuous, n_segments
+        data               (n_channels, n_samples)      continuous
+        segment_0 .. N     one dataset each             discontinuous
+    /channels
+        names              one entry per channel
+        units              one entry per channel
+        sampling_rates     one entry per channel
+    /events
+        onsets, durations, descriptions
+    /metadata              attrs: start_datetime, subject_id, equipment,
+                                  source_format, source_file
+
+Four input formats therefore produce two output shapes, and the branch is
+not by format but by whether the recording has gaps. EDF, EDF+C and
+BrainVision are continuous; EDF+D is discontinuous. The
+/signals attribute "discontinuous" states which shape a file uses.
+
+Channels are identified by position, not by label. Row i of
+/signals/data is the channel named in /channels/names[i], carrying
+/channels/units[i] at /channels/sampling_rates[i]. This mirrors EDF's own
+convention, where the header lists signals in order and every data
+record holds channel blocks in that same order.
+
+THE GUARANTEE: a uniform-rate recording stores its signals as a single
+rectangular dataset at /signals/data, with row i corresponding to
+/channels/names[i]. Support for mixed per-channel sampling rates may add
+further modes, but it will not change this layout. Downstream code
+written against the rectangular form stays valid.
+
+This matters because a rectangular array cannot hold channels sampled at
+different rates — over thirty seconds, a 100 Hz channel needs three
+thousand samples and a 1 Hz channel needs thirty. Supporting such files
+requires a second storage mode rather than a modification of this one,
+and downstream code will have to handle or refuse that mode explicitly,
+exactly as it already must for discontinuous recordings.
+
+
 FUTURE INTEGRATION STRATEGY: SPIKE2 (.SMR / .SMRX) DATA
 
 1. CURRENT STATUS
