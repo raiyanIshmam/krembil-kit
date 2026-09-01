@@ -1,25 +1,35 @@
 """
-Ingestion tests for all supported EDF format variants and BrainVision.
+Ingestion tests for plain EDF, EDF+C, EDF+D and BrainVision.
 
-Each test ingests a file, opens the resulting HDF5, and verifies:
-  - Schema structure (version, groups, channel names, sampling rates)
-  - Signal data (every channel, every sample, zero tolerance)
-  - Annotations where applicable
+Most tests ingest a file, open the resulting HDF5 and check it against
+the source:
+  - Schema structure: version, groups, channel names, sampling rates
+  - Signal data: every channel, every sample, at zero tolerance
+  - Annotations, where the format carries them
 
-Real data tests auto-skip when test files are absent.
-Synthetic tests always run.
+The rest cover what ingest does with a path it cannot use, which files
+the readers refuse outright, and what write_hdf5 rejects before it opens
+an output file.
+
+Real data tests skip themselves when the files are absent, so the suite
+runs on a machine without them. Synthetic tests always run.
 """
 
-import numpy as np
-import h5py
-import mne
-import pytest
+from collections import Counter
 from pathlib import Path
 
+import h5py
+import mne
+import numpy as np
+import pytest
+
 from krembil_kit.io import ingest, SCHEMA_VERSION
-from krembil_kit.io._readers_edf import _read_header
+from krembil_kit.io._readers_edf import _parse_tals, _read_header
+from krembil_kit.io._schema import write_hdf5
 from conftest import (
     DATA_DIR, require_file, require_dir,
+    create_edfd_with_two_annotation_channels,
+    create_edfd_without_annotation_channel,
     create_synthetic_edf, create_synthetic_edfd,
 )
 
@@ -28,6 +38,10 @@ from conftest import (
 # Shared verification
 # ────────────────────────────────────────────────────────────────────
 
+# Signals are compared in chunks so that a large file is never held in
+# memory twice. This is deliberately not the same size the writer uses,
+# so a mistake tied to chunk boundaries cannot cancel itself out between
+# the write and the read.
 CHUNK_SECONDS = 10.0
 
 
@@ -46,6 +60,12 @@ def verify_structure(h5_path, expected_channels, expected_sfreq,
         assert names == list(expected_channels)
         assert np.all(f["channels"]["sampling_rates"][:] == expected_sfreq)
         assert f["signals"].attrs["discontinuous"] == expect_discontinuous
+
+        # The three channel datasets are parallel: entry i of each
+        # describes the same channel. Length is the part worth asserting;
+        # what the units actually say is a separate question.
+        assert len(f["channels"]["units"][:]) == len(names)
+        assert len(f["channels"]["sampling_rates"][:]) == len(names)
 
 
 def verify_signals(h5_path, raw):
@@ -68,7 +88,16 @@ def verify_signals(h5_path, raw):
 
 
 def verify_segments(h5_path, ref_paths):
-    """Compare each HDF5 segment against a reference EDF+C file."""
+    """
+    Compare every segment against its reference file, every channel and
+    every sample, at zero tolerance.
+
+    The channel and length assertions are deliberately strict. Comparing
+    only the channels whose names appear in both files, over only the
+    shorter of the two segments, would let this pass while checking a
+    fraction of the data — so a mismatch in either is a failure rather
+    than something to work around.
+    """
     with h5py.File(h5_path, "r") as f:
         n_segments = f["signals"].attrs["n_segments"]
         assert n_segments == len(ref_paths)
@@ -80,18 +109,28 @@ def verify_segments(h5_path, ref_paths):
 
         for i in range(n_segments):
             h5_data = f["signals"][f"segment_{i}"][:]
-            ref = mne.io.read_raw_edf(str(ref_paths[i]), preload=False, verbose=False)
+            ref = mne.io.read_raw_edf(
+                str(ref_paths[i]), preload=False, verbose=False
+            )
             ref_names = ref.ch_names
-            common = [ch for ch in h5_names if ch in ref_names]
-            assert len(common) > 0
 
-            n_samp = min(h5_data.shape[1], ref.n_times)
-            for ch in common:
-                h5_ch = h5_data[h5_names.index(ch), :n_samp]
-                ref_ch = ref.get_data(
-                    picks=[ref_names.index(ch)], start=0, stop=n_samp
+            absent = [ch for ch in h5_names if ch not in ref_names]
+            assert not absent, (
+                f"segment {i}: reference file has no channel named {absent}"
+            )
+            assert h5_data.shape[1] == ref.n_times, (
+                f"segment {i}: {h5_data.shape[1]} samples in the HDF5 but "
+                f"{ref.n_times} in the reference"
+            )
+
+            for ch in h5_names:
+                h5_channel = h5_data[h5_names.index(ch), :]
+                ref_channel = ref.get_data(
+                    picks=[ref_names.index(ch)]
                 )[0].astype(np.float32)
-                assert np.max(np.abs(h5_ch - ref_ch)) == 0.0
+                assert np.max(np.abs(h5_channel - ref_channel)) == 0.0, (
+                    f"segment {i}, channel {ch}: samples differ"
+                )
 
 
 def verify_events(h5_path, raw):
@@ -107,12 +146,72 @@ def verify_events(h5_path, raw):
 
     if annot is not None and len(annot) > 0:
         assert len(onsets) == len(annot)
+
+        # Onsets and durations are decimal text in the EDF file, parsed
+        # to float separately by us and by MNE, so allow the last digit
+        # to differ rather than demanding identical floats.
+        tolerance = 0.001
         for i in range(len(annot)):
-            assert abs(onsets[i] - annot.onset[i]) < 0.001
-            assert abs(durations[i] - annot.duration[i]) < 0.001
+            assert abs(onsets[i] - annot.onset[i]) < tolerance
+            assert abs(durations[i] - annot.duration[i]) < tolerance
             assert descriptions[i] == annot.description[i]
     else:
         assert len(onsets) == 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# Entry point
+# ────────────────────────────────────────────────────────────────────
+
+class TestIngestEntryPoint:
+    """
+    What ingest does with the path it is given, before any format
+    specific reader runs.
+    """
+
+    def test_missing_file(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="Source file not found"):
+            ingest(str(tmp_path / "absent.edf"))
+
+    def test_unsupported_extension(self, tmp_path):
+        """
+        The message names the extension that was rejected and lists the
+        ones that work, so a caller who passed the wrong file learns
+        both facts at once.
+        """
+        other = tmp_path / "recording.txt"
+        other.write_text("not a recording")
+
+        with pytest.raises(ValueError, match=r"Cannot read '\.txt'"):
+            ingest(str(other))
+
+    def test_default_output_path(self):
+        """
+        With no output_path, ingest writes beside the source file with
+        the extension swapped for .h5. Every other test passes an
+        explicit path, so this is the only check on the default.
+        """
+        source, ch_names, sfreq = create_synthetic_edf()
+
+        result = ingest(source)
+
+        assert result.resolve() == Path(source).with_suffix(".h5").resolve()
+        assert result.exists()
+        verify_structure(str(result), ch_names, sfreq,
+                         expect_discontinuous=False)
+
+    def test_brainvision_eeg_without_header(self, tmp_path):
+        """
+        BrainVision splits one recording across .vhdr, .eeg and .vmrk.
+        Handed the .eeg alone, the reader goes looking for the .vhdr
+        beside it — copying one file of the three is an easy mistake, so
+        the error names the file it could not find.
+        """
+        orphan = tmp_path / "recording.eeg"
+        orphan.write_bytes(b"\x00" * 32)
+
+        with pytest.raises(FileNotFoundError, match="header file not found"):
+            ingest(str(orphan))
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -122,44 +221,133 @@ def verify_events(h5_path, raw):
 class TestSyntheticEDF:
 
     def test_structure(self, tmp_path):
-        path, _, ch_names, sfreq = create_synthetic_edf(edf_plus=False)
+        path, ch_names, sfreq = create_synthetic_edf(edf_plus=False)
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         verify_structure(h5, ch_names, sfreq, expect_discontinuous=False)
 
     def test_signals(self, tmp_path):
-        path, _, _, _ = create_synthetic_edf(edf_plus=False)
+        path, _, _ = create_synthetic_edf(edf_plus=False)
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
-        with h5py.File(h5, "r") as f:
-            h5_data = f["signals"]["data"][:]
-        edf_data = raw.get_data().astype(np.float32)
-        assert np.max(np.abs(h5_data - edf_data)) == 0.0
+        verify_signals(h5, raw)
+
+    def test_no_events(self, tmp_path):
+        """
+        A plain EDF has no annotation channel, so /events must exist and
+        be empty rather than be absent.
+        """
+        path, _, _ = create_synthetic_edf(edf_plus=False)
+        h5 = str(tmp_path / "out.h5")
+        ingest(path, output_path=h5)
+        raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
+        verify_events(h5, raw)
+
+
+class TestMalformedEDF:
+    """
+    Files the readers must refuse rather than convert.
+    """
+
+    def test_edfd_without_annotation_channel(self, tmp_path):
+        """
+        A discontinuous file with no 'EDF Annotations' signal has nowhere
+        to record when each data record starts, so it cannot be split
+        into segments. Ingest must say so rather than guess.
+        """
+        path = create_edfd_without_annotation_channel()
+        with pytest.raises(ValueError, match="record start times"):
+            ingest(path, output_path=str(tmp_path / "out.h5"))
+
+    def test_two_annotation_channels(self, tmp_path):
+        """
+        Only the first 'EDF Annotations' signal carries record start
+        times, so with two of them the reader cannot tell which to trust.
+        Reading the wrong one would give event times in place of record
+        start times, and the segment boundaries computed from them would
+        be wrong with nothing to indicate it.
+        """
+        path = create_edfd_with_two_annotation_channels()
+        with pytest.raises(ValueError, match="'EDF Annotations' signals"):
+            ingest(path, output_path=str(tmp_path / "out.h5"))
+
+
+class TestSchemaWriter:
+    """
+    Checks write_hdf5 performs directly, without going through a reader.
+    """
+
+    def test_channel_arrays_must_agree_in_length(self, tmp_path):
+        """
+        Names, units and rates describe the same channels by position, so
+        a length mismatch would mislabel every channel past the first
+        disagreement. write_hdf5 refuses before opening the file.
+        """
+        with pytest.raises(ValueError, match="does not line up"):
+            write_hdf5(
+                output_path=str(tmp_path / "out.h5"),
+                signals=None,
+                channel_names=["A", "B", "C"],
+                channel_units=["V", "V"],
+                sampling_rates=np.array([256.0, 256.0, 256.0]),
+            )
+
+    def test_nothing_is_written_when_channels_disagree(self, tmp_path):
+        """
+        The check runs before h5py opens the file, which truncates on
+        open — so a rejected call must not leave a file behind.
+        """
+        out = tmp_path / "out.h5"
+        with pytest.raises(ValueError):
+            write_hdf5(
+                output_path=str(out),
+                signals=None,
+                channel_names=["A", "B"],
+                channel_units=["V"],
+                sampling_rates=np.array([256.0, 256.0]),
+            )
+        assert not out.exists()
+
+    def test_discontinuous_requires_segment_start_times(self, tmp_path):
+        """
+        Segment start times are the only record of when each segment
+        began — nothing else in the file carries it. Writing a
+        discontinuous recording without them would lose the timing
+        permanently, so the writer refuses, and refuses before opening
+        the file so no partial output is left behind.
+        """
+        out = tmp_path / "out.h5"
+        with pytest.raises(ValueError, match="segment_start_times is required"):
+            write_hdf5(
+                output_path=str(out),
+                signals=[np.zeros((2, 8), dtype=np.float32)],
+                channel_names=["A", "B"],
+                channel_units=["V", "V"],
+                sampling_rates=np.array([256.0, 256.0]),
+                discontinuous=True,
+            )
+        assert not out.exists()
 
 
 class TestSyntheticEDFC:
 
     def test_structure(self, tmp_path):
-        path, _, ch_names, sfreq = create_synthetic_edf()
+        path, ch_names, sfreq = create_synthetic_edf()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         verify_structure(h5, ch_names, sfreq, expect_discontinuous=False)
 
     def test_signals(self, tmp_path):
-        path, _, _, _ = create_synthetic_edf()
+        path, _, _ = create_synthetic_edf()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
-        # EDF 16-bit quantization: compare against MNE's reading
-        with h5py.File(h5, "r") as f:
-            h5_data = f["signals"]["data"][:]
-        edf_data = raw.get_data().astype(np.float32)
-        assert np.max(np.abs(h5_data - edf_data)) == 0.0
+        verify_signals(h5, raw)
 
     def test_annotations(self, tmp_path):
         annotations = [(1.0, 0.0, "event_A"), (3.5, 0.5, "event_B")]
-        path, _, _, _ = create_synthetic_edf(annotations=annotations)
+        path, _, _ = create_synthetic_edf(annotations=annotations)
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
@@ -169,39 +357,50 @@ class TestSyntheticEDFC:
 class TestSyntheticEDFD:
 
     def test_structure(self, tmp_path):
-        path, _, _, ch_names, sfreq, _ = create_synthetic_edfd()
+        path, _, _, ch_names, sfreq = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         verify_structure(h5, ch_names, sfreq, expect_discontinuous=True)
 
     def test_segment_count(self, tmp_path):
-        path, segments, _, _, _, _ = create_synthetic_edfd()
+        path, segments, _, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         with h5py.File(h5, "r") as f:
             assert f["signals"].attrs["n_segments"] == len(segments)
 
     def test_segment_start_times(self, tmp_path):
-        path, _, start_times, _, _, _ = create_synthetic_edfd()
+        """
+        Each segment's start time is stored on its dataset. The fixture
+        uses whole seconds, which survive the trip through ASCII in the
+        annotation channel exactly, so there is no rounding to allow for.
+        """
+        path, _, start_times, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         with h5py.File(h5, "r") as f:
-            for i, expected in enumerate(start_times):
-                actual = f["signals"][f"segment_{i}"].attrs["start_time_seconds"]
-                assert abs(actual - expected) < 0.01
+            actual = [
+                f["signals"][f"segment_{i}"].attrs["start_time_seconds"]
+                for i in range(len(start_times))
+            ]
+        assert actual == pytest.approx(start_times)
 
     def test_signals(self, tmp_path):
-        path, _, _, _, _, _ = create_synthetic_edfd()
+        path, _, _, _, _ = create_synthetic_edfd()
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
         raw = mne.io.read_raw_edf(path, preload=False, verbose=False)
+        # MNE reads EDF+D as one continuous block and ignores the gaps,
+        # so segment i sits at the sum of the lengths before it.
         with h5py.File(h5, "r") as f:
-            total = 0
+            offset = 0
             for i in range(f["signals"].attrs["n_segments"]):
                 seg = f["signals"][f"segment_{i}"][:]
-                mne_seg = raw.get_data(start=total, stop=total + seg.shape[1]).astype(np.float32)
+                mne_seg = raw.get_data(
+                    start=offset, stop=offset + seg.shape[1]
+                ).astype(np.float32)
                 assert np.max(np.abs(seg - mne_seg)) == 0.0
-                total += seg.shape[1]
+                offset += seg.shape[1]
 
     def test_annotations(self, tmp_path):
         annotations = [
@@ -210,7 +409,7 @@ class TestSyntheticEDFD:
             (5.5, 2.0, "seizure"),     # in segment 1, with duration
             (10.2, 0.0, "spike"),      # in segment 2
         ]
-        path, _, _, _, _, _ = create_synthetic_edfd(annotations=annotations)
+        path, _, _, _, _ = create_synthetic_edfd(annotations=annotations)
         h5 = str(tmp_path / "out.h5")
         ingest(path, output_path=h5)
 
@@ -222,16 +421,18 @@ class TestSyntheticEDFD:
                 for d in f["events"]["descriptions"][:]
             ]
 
-        for onset, dur, desc in annotations:
-            matched = any(
-                h5_descs[i] == desc
-                and abs(h5_onsets[i] - onset) < 0.01
-                and abs(h5_durations[i] - dur) < 0.01
-                for i in range(len(h5_onsets))
-            )
-            assert matched, (
-                f"Annotation not found: t={onset}s \"{desc}\""
-            )
+        # Compared element by element, not searched for. Each annotation
+        # goes into the record covering its onset and the records are
+        # written in time order, so the four come back in the order they
+        # were given. Searching instead would pass even if one were
+        # duplicated and another dropped.
+        assert h5_descs == [desc for _, _, desc in annotations]
+        assert h5_onsets == pytest.approx(
+            [onset for onset, _, _ in annotations], abs=1e-3
+        )
+        assert h5_durations == pytest.approx(
+            [dur for _, dur, _ in annotations], abs=1e-3
+        )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -266,7 +467,7 @@ class TestRealEDF:
         """
         Files with per-channel sampling rates cannot be ingested
         losslessly, so ingest must refuse them rather than write
-        resampled data. See known_issues.txt item 1.
+        resampled data.
         """
         require_file(edf_file)
         if not _has_mixed_rates(edf_file):
@@ -331,10 +532,28 @@ class TestRealEDFD:
 
     def test_events(self, tmp_path):
         """
-        Verify annotations by comparing against reference segments.
-        Each reference segment's annotations are offset by the
-        corresponding HDF5 segment start time to get absolute times.
-        Every reference annotation must have a match in the HDF5.
+        The ingested annotations must match the reference segments
+        exactly — same count, same descriptions, same times, both ways.
+
+        The reference annotations are read with our own TAL parser rather
+        than through MNE. MNE discards annotations it judges out of range,
+        11 of the 356 here, so comparing against its count would measure
+        our complete output against an already incomplete number. The
+        comparison is still meaningful because edfplusdcnv wrote the bytes
+        being parsed, and MNE's own reading agrees with ours on the 345 it
+        keeps.
+
+        Reference onsets are relative to a whole second. EDF headers store
+        start times only to the second, so edfplusdcnv gives each segment
+        a whole-second header time and carries the remainder in the first
+        TAL. An absolute time is therefore int(start) + onset rather than
+        start + onset, and using the latter shifts every annotation by the
+        fractional part of its segment's start.
+
+        Sorting both sides and comparing element by element rather than
+        searching for matches: ten annotations here share one onset and
+        two of those are exact duplicates, so a per-item search would pass
+        even if a duplicate went missing.
         """
         require_file(EDFD_FILE)
         require_dir(EDFD_REF_DIR)
@@ -342,45 +561,91 @@ class TestRealEDFD:
         h5 = str(tmp_path / "out.h5")
         ingest(str(EDFD_FILE), output_path=h5)
 
-        ref_files = sorted(EDFD_REF_DIR.glob("*.edf"), key=lambda p: p.name)
-
         with h5py.File(h5, "r") as f:
-            h5_onsets = f["events"]["onsets"][:]
-            h5_descs = [
+            descriptions = [
                 d.decode() if isinstance(d, bytes) else d
                 for d in f["events"]["descriptions"][:]
             ]
+            ingested = sorted(zip(f["events"]["onsets"][:], descriptions))
 
-            # Collect reference annotations with absolute times
-            n_segments = f["signals"].attrs["n_segments"]
-            seg_starts = [
+            segment_starts = [
                 f["signals"][f"segment_{i}"].attrs["start_time_seconds"]
-                for i in range(n_segments)
+                for i in range(f["signals"].attrs["n_segments"])
             ]
 
-        ref_annotations = []
-        for seg_idx, ref_file in enumerate(ref_files):
-            if seg_idx >= len(seg_starts):
-                break
-            ref_raw = mne.io.read_raw_edf(str(ref_file), preload=False, verbose=False)
-            annot = ref_raw.annotations
-            if annot is None or len(annot) == 0:
-                continue
-            for onset, desc in zip(annot.onset, annot.description):
-                ref_annotations.append((seg_starts[seg_idx] + onset, desc))
+        ref_files = sorted(EDFD_REF_DIR.glob("*.edf"), key=lambda p: p.name)
+        assert len(ref_files) == len(segment_starts)
 
-        assert len(ref_annotations) > 0, "No reference annotations found"
+        reference = []
+        for start, ref_file in zip(segment_starts, ref_files):
+            _, annotations = _parse_tals(
+                str(ref_file), _read_header(str(ref_file))
+            )
+            for annotation in annotations:
+                reference.append(
+                    (int(start) + annotation["onset"],
+                     annotation["description"])
+                )
+        reference.sort()
 
-        # Every reference annotation must match one in the HDF5
-        tolerance = 0.5
-        for ref_onset, ref_desc in ref_annotations:
-            matched = any(
-                h5_descs[i] == ref_desc and abs(h5_onsets[i] - ref_onset) < tolerance
-                for i in range(len(h5_onsets))
+        assert len(ingested) == len(reference), (
+            f"{len(ingested)} annotations ingested but {len(reference)} "
+            f"across the reference segments"
+        )
+
+        # One sample at 1024 Hz is close to 0.001 s. Onsets are decimal
+        # text in both files, so allow the last digit to differ.
+        tolerance = 0.001
+        for (onset, description), (ref_onset, ref_description) in zip(
+            ingested, reference
+        ):
+            assert description == ref_description
+            assert abs(onset - ref_onset) < tolerance, (
+                f"{description!r}: ingested at {onset}, "
+                f"reference at {ref_onset}"
             )
-            assert matched, (
-                f"Annotation not found in HDF5: t={ref_onset:.1f}s \"{ref_desc}\""
+
+    def test_events_include_everything_mne_finds(self, tmp_path):
+        """
+        Our TAL parser must recover at least what MNE recovers.
+
+        test_events parses the reference segments with our own parser,
+        which would not catch a mistake that misread both sides the same
+        way. MNE is a separate implementation reading the same bytes, so
+        it is an independent check — over the 345 of 356 annotations it
+        keeps, discarding the rest as outside the data range.
+
+        Descriptions rather than times, because the failure this guards
+        against is mis-splitting TAL fields, which would corrupt or split
+        the text. The times are checked against the reference bytes in
+        test_events.
+        """
+        require_file(EDFD_FILE)
+        require_dir(EDFD_REF_DIR)
+
+        h5 = str(tmp_path / "out.h5")
+        ingest(str(EDFD_FILE), output_path=h5)
+
+        with h5py.File(h5, "r") as f:
+            ours = Counter(
+                d.decode() if isinstance(d, bytes) else d
+                for d in f["events"]["descriptions"][:]
             )
+
+        from_mne = Counter()
+        for ref_file in sorted(EDFD_REF_DIR.glob("*.edf")):
+            raw = mne.io.read_raw_edf(
+                str(ref_file), preload=False, verbose=False
+            )
+            if raw.annotations is not None:
+                from_mne.update(raw.annotations.description)
+
+        assert from_mne, "MNE found no annotations in the reference segments"
+
+        # Counter subtraction keeps only descriptions MNE found more of
+        # than we did, which is exactly what "we lost something" means.
+        missing = from_mne - ours
+        assert not missing, f"MNE found annotations we did not: {dict(missing)}"
 
 
 # ────────────────────────────────────────────────────────────────────

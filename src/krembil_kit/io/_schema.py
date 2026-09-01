@@ -107,6 +107,13 @@ def write_hdf5(
             f"they must be the same length."
         )
 
+    if discontinuous and segment_start_times is None:
+        raise ValueError(
+            "segment_start_times is required for a discontinuous "
+            "recording. It is the only record of when each segment began, "
+            "and nothing else in the file carries that."
+        )
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -167,11 +174,6 @@ def _write_discontinuous_signals(group, segments, segment_start_times):
     Write each segment of a discontinuous recording as its own dataset,
     tagged with its absolute start time.
     """
-    if segment_start_times is None:
-        raise ValueError(
-            "segment_start_times is required for discontinuous recordings."
-        )
-
     paired = zip(segments, segment_start_times)
     for idx, (segment, start_time) in enumerate(paired):
         dataset = group.create_dataset(

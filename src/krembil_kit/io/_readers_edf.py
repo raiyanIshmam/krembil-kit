@@ -214,8 +214,12 @@ def read_edf_plus_d(file_path: str) -> Dict[str, Any]:
     the reader and writer restructured.
     """
     file_path = str(Path(file_path).resolve())
+    file_name = Path(file_path).name
+
     header = _read_header(file_path)
-    _reject_mixed_sampling_rates(header, Path(file_path).name)
+    _reject_mixed_sampling_rates(header, file_name)
+    _reject_multiple_annotation_channels(header, file_name)
+
     raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
 
     record_onsets, tal_annotations = _parse_tals(file_path, header)
@@ -378,6 +382,32 @@ def _reject_mixed_sampling_rates(header: EdfHeader, file_name: str) -> None:
         )
 
 
+def _reject_multiple_annotation_channels(
+    header: EdfHeader,
+    file_name: str,
+) -> None:
+    """
+    Raise if a discontinuous recording declares more than one
+    'EDF Annotations' signal.
+
+    EDF+ permits several, but only the first carries the record start
+    times (spec 2.2.4) and the others need not carry them at all. Reading
+    the wrong one would give event times where record start times belong,
+    and the segment boundaries computed from those would be wrong with
+    nothing to indicate it.
+
+    Only discontinuous recordings need this. A continuous file's
+    annotations come from MNE, which reads every annotation signal, and
+    no record start times are involved.
+    """
+    if len(header.annotation_indices) > 1:
+        raise ValueError(
+            f"{file_name} has {len(header.annotation_indices)} "
+            f"'EDF Annotations' signals (at positions "
+            f"{header.annotation_indices}). Only one is supported."
+        )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Private: TAL parsing and segment detection
 # ────────────────────────────────────────────────────────────────────
@@ -415,19 +445,12 @@ def _parse_tals(
         'description' (str). Collected from all non-time-keeping
         TALs across all records.
     """
-    # Spec 2.2.4 puts time-keeping in the FIRST annotation signal only,
-    # and further annotation signals need not carry one at all, so
-    # reading the wrong one would yield event times in place of record
-    # start times. Refuse rather than guess.
     if not header.annotation_indices:
         return [], []
-    if len(header.annotation_indices) > 1:
-        raise ValueError(
-            f"{Path(file_path).name} has "
-            f"{len(header.annotation_indices)} 'EDF Annotations' signals "
-            f"(at positions {header.annotation_indices}). Only one is "
-            f"supported."
-        )
+
+    # The first annotation signal is the one holding record start times
+    # (spec 2.2.4). Callers reject files declaring more than one, so
+    # taking the first here is not a choice between candidates.
     annotation_idx = header.annotation_indices[0]
 
     signal_sizes = [s * _BYTES_PER_SAMPLE for s in header.signal_samples]

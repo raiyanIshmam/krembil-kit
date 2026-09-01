@@ -217,6 +217,21 @@ class Recording:
             )
         return [self._channel_names.index(ch) for ch in channels]
 
+    def _read_rows(self, dataset, indices: List[int], start, stop):
+        """
+        Read the given rows of a dataset, in the given order.
+
+        h5py rejects fancy indexing whose indices do not strictly ascend,
+        so a caller asking for channels out of order, or for one channel
+        twice, cannot be passed straight through. Reading the sorted set
+        once and arranging rows afterwards honours the requested order
+        without reading anything twice.
+        """
+        wanted = sorted(set(indices))
+        block = dataset[wanted, start:stop]
+        row_of = {index: row for row, index in enumerate(wanted)}
+        return np.stack([block[row_of[index]] for index in indices])
+
     def get_signals(
         self,
         start: Optional[int] = None,
@@ -267,7 +282,9 @@ class Recording:
             )
 
         if channels is not None:
-            return dataset[self._channel_indices(channels), start:stop]
+            return self._read_rows(
+                dataset, self._channel_indices(channels), start, stop
+            )
 
         return dataset[:, start:stop]
 
@@ -306,7 +323,9 @@ class Recording:
         dataset = self._file["signals"][f"segment_{index}"]
 
         if channels is not None:
-            return dataset[self._channel_indices(channels), :]
+            return self._read_rows(
+                dataset, self._channel_indices(channels), 0, dataset.shape[1]
+            )
 
         return dataset[:]
 

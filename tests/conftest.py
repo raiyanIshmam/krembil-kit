@@ -10,11 +10,34 @@ Synthetic data tests always run.
 
 import pytest
 import numpy as np
+import shutil
 import tempfile
 from pathlib import Path
 
 # Base directory for test data (relative to repo root)
 DATA_DIR = Path(__file__).parent.parent / "data" / "test"
+
+# The file generators below are plain functions rather than fixtures,
+# because one test may need several files and because some generators
+# call others. That puts their temporary directories outside pytest's
+# tmp_path teardown, so they are collected here and removed when the
+# session ends.
+_TEMP_DIRS = []
+
+
+def _temp_dir() -> Path:
+    path = Path(tempfile.mkdtemp())
+    _TEMP_DIRS.append(path)
+    return path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _remove_temp_dirs():
+    yield
+    for path in _TEMP_DIRS:
+        # A directory left behind by a still-open file handle is not
+        # worth failing an otherwise green run over.
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -33,9 +56,6 @@ def require_dir(path):
         pytest.skip(f"Test directory not found: {path}")
 
 
-
-
-
 # ────────────────────────────────────────────────────────────────────
 # Synthetic EDF generation
 # ────────────────────────────────────────────────────────────────────
@@ -43,21 +63,24 @@ def require_dir(path):
 def create_synthetic_edf(n_channels=3, duration_sec=5, sfreq=256,
                          annotations=None, edf_plus=True):
     """
-    Create a synthetic EDF+C file with known values.
+    Create a synthetic EDF file holding sine waves.
 
-    Returns (file_path, expected_data, channel_names, sfreq).
-    The file is written to a temporary directory.
+    edf_plus picks the subtype: True writes EDF+C, False writes plain
+    EDF. The two differ only in the reserved header field, and that
+    field is what the readers dispatch on.
+
+    Returns (file_path, channel_names, sfreq). The sample values are not
+    returned — tests that check them read the file back through MNE, so
+    a mistake in this generator cannot cancel out against itself.
     """
     import pyedflib
 
-    tmp_dir = tempfile.mkdtemp()
-    file_path = Path(tmp_dir) / "synthetic.edf"
+    file_path = _temp_dir() / "synthetic.edf"
 
     n_samples = int(duration_sec * sfreq)
     channel_names = [f"CH{i}" for i in range(n_channels)]
 
     # Deterministic signal: sine waves with different frequencies
-    np.random.seed(42)
     data = np.zeros((n_channels, n_samples))
     for i in range(n_channels):
         t = np.arange(n_samples) / sfreq
@@ -91,7 +114,58 @@ def create_synthetic_edf(n_channels=3, duration_sec=5, sfreq=256,
     writer.writeSamples(data)
     writer.close()
 
-    return str(file_path), data, channel_names, sfreq
+    return str(file_path), channel_names, sfreq
+
+
+def create_edfd_without_annotation_channel():
+    """
+    Create a file marked EDF+D that has no 'EDF Annotations' signal.
+
+    Such a file is malformed: EDF+ requires the signal because it is
+    where each data record's start time is stored, and without those a
+    discontinuous recording cannot be split into segments.
+
+    Built by writing a plain EDF and overwriting the reserved field,
+    since that field is the only thing distinguishing the two.
+
+    Returns the file path.
+    """
+    source, _, _ = create_synthetic_edf(edf_plus=False)
+
+    target = _temp_dir() / "edfd_without_annotations.edf"
+
+    original = Path(source).read_bytes()
+    target.write_bytes(
+        original[:192] + b"EDF+D".ljust(44) + original[236:]
+    )
+    return str(target)
+
+
+def create_edfd_with_two_annotation_channels():
+    """
+    Create an EDF+D file declaring two 'EDF Annotations' signals.
+
+    EDF+ permits more than one, but only the first carries the record
+    start times (EDF+ specification, section 2.2.4), and the others need
+    not carry them at all. Reading the wrong one would give event times
+    where record start times belong.
+
+    Built by relabelling an ordinary channel in a normal synthetic file.
+    Only the 16-byte label changes, so the signal count and record size
+    stay as they were and no other part of the file needs adjusting. The
+    relabelled channel still holds ordinary samples rather than text,
+    which does not matter because the file is rejected on its header.
+
+    Returns the file path.
+    """
+    source, _, _, _, _ = create_synthetic_edfd()
+
+    target = _temp_dir() / "edfd_two_annotation_channels.edf"
+
+    patched = bytearray(Path(source).read_bytes())
+    patched[256:272] = b"EDF Annotations".ljust(16)
+    target.write_bytes(bytes(patched))
+    return str(target)
 
 
 def create_synthetic_edfd(n_channels=3, sfreq=256, annotations=None):
@@ -107,10 +181,9 @@ def create_synthetic_edfd(n_channels=3, sfreq=256, annotations=None):
         These are written into the TAL of the appropriate data record.
 
     Returns (file_path, segments_data, segment_start_times,
-             channel_names, sfreq, annotations).
+             channel_names, sfreq).
     """
-    tmp_dir = tempfile.mkdtemp()
-    file_path = Path(tmp_dir) / "synthetic_d.edf"
+    file_path = _temp_dir() / "synthetic_d.edf"
 
     channel_names = [f"CH{i}" for i in range(n_channels)]
 
@@ -122,7 +195,6 @@ def create_synthetic_edfd(n_channels=3, sfreq=256, annotations=None):
     ]
 
     # Generate deterministic data for each segment
-    np.random.seed(99)
     segments_data = []
     segment_start_times = []
 
@@ -144,21 +216,24 @@ def create_synthetic_edfd(n_channels=3, sfreq=256, annotations=None):
     )
 
     return (str(file_path), segments_data, segment_start_times,
-            channel_names, sfreq, annotations)
+            channel_names, sfreq)
 
 
 def _write_edfd_bytes(file_path, segments, start_times,
                       channel_names, sfreq, annotations=None):
     """
-    Write a minimal EDF+D file from raw bytes.
+    Write a minimal EDF+D file from raw bytes, because no library
+    writes EDF+D.
 
-    Follows the EDF/EDF+ specification exactly:
-    - Fixed header (256 bytes)
-    - Signal headers (256 * n_signals bytes)
-    - Data records with TAL annotation channel
+    Minimal means it carries only what the readers need: a 256-byte
+    fixed header, one 256-byte header per signal, then data records each
+    holding every signal's samples followed by the annotation channel.
+    Patient and recording fields are placeholders, and every channel
+    shares one physical range. It is a valid EDF+D file, not a complete
+    exercise of the format.
 
-    Annotations are placed in the TAL of the data record whose
-    time range contains the annotation onset.
+    Each annotation is written into the record whose time range contains
+    its onset.
     """
     n_channels = len(channel_names)
     n_signals = n_channels + 1  # +1 for EDF Annotations signal
@@ -168,29 +243,36 @@ def _write_edfd_bytes(file_path, segments, start_times,
     # Annotation channel: reserve 256 bytes (128 "samples") per record
     annot_samples_per_record = 128
 
-    # Count total data records across all segments
-    total_records = 0
-    records_per_segment = []
-    for seg in segments:
-        n_recs = seg.shape[1] // samples_per_record
-        records_per_segment.append(n_recs)
-        total_records += n_recs
+    # EDF holds whole data records only. A segment that is not a whole
+    # number of records would lose its tail here without saying so, and
+    # the file would then disagree with the segments handed back to the
+    # test, so refuse it instead.
+    for seg_idx, seg in enumerate(segments):
+        if seg.shape[1] % samples_per_record:
+            raise ValueError(
+                f"Segment {seg_idx} holds {seg.shape[1]} samples, which is "
+                f"not a whole number of {samples_per_record}-sample records. "
+                f"Pick a segment duration that divides evenly."
+            )
+
+    records_per_segment = [
+        seg.shape[1] // samples_per_record for seg in segments
+    ]
+    total_records = sum(records_per_segment)
 
     # Build a mapping of record index → list of annotations for that record
     annot_by_record = {}
     if annotations:
-        record_idx = 0
-        for seg_idx, (seg_start, seg) in enumerate(zip(start_times, segments)):
-            n_recs = records_per_segment[seg_idx]
-            for rec in range(n_recs):
+        for seg_idx, seg_start in enumerate(start_times):
+            first_record = sum(records_per_segment[:seg_idx])
+            for rec in range(records_per_segment[seg_idx]):
                 rec_onset = seg_start + rec * record_duration
                 rec_end = rec_onset + record_duration
                 for onset, dur, desc in annotations:
                     if rec_onset <= onset < rec_end:
-                        annot_by_record.setdefault(record_idx + rec, []).append(
-                            (onset, dur, desc)
-                        )
-            record_idx += n_recs
+                        annot_by_record.setdefault(
+                            first_record + rec, []
+                        ).append((onset, dur, desc))
 
     # Physical range for signals
     phys_min = -500.0
@@ -266,13 +348,12 @@ def _write_edfd_bytes(file_path, segments, start_times,
 
         # Write data records
         scale = (phys_max - phys_min) / (dig_max - dig_min)
-        global_rec = 0
 
         for seg_idx, seg in enumerate(segments):
-            n_recs = records_per_segment[seg_idx]
+            first_record = sum(records_per_segment[:seg_idx])
             seg_start = start_times[seg_idx]
 
-            for rec in range(n_recs):
+            for rec in range(records_per_segment[seg_idx]):
                 # Write ordinary signal samples
                 rec_start = rec * samples_per_record
                 rec_end = rec_start + samples_per_record
@@ -293,8 +374,9 @@ def _write_edfd_bytes(file_path, segments, start_times,
                 tal_content = f"+{onset_time}\x14\x14\x00"
 
                 # Event TALs for this record
-                if global_rec in annot_by_record:
-                    for evt_onset, evt_dur, evt_desc in annot_by_record[global_rec]:
+                record_idx = first_record + rec
+                if record_idx in annot_by_record:
+                    for evt_onset, evt_dur, evt_desc in annot_by_record[record_idx]:
                         if evt_dur > 0:
                             tal_content += f"+{evt_onset}\x15{evt_dur}\x14{evt_desc}\x14\x00"
                         else:
@@ -303,5 +385,3 @@ def _write_edfd_bytes(file_path, segments, start_times,
                 tal_bytes = tal_content.encode("ascii")
                 padded = tal_bytes + b"\x00" * (annot_byte_size - len(tal_bytes))
                 f.write(padded)
-
-                global_rec += 1
