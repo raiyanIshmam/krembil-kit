@@ -7,7 +7,7 @@ All readers funnel their output through write_hdf5() so every file
 has the same structure regardless of source format.
 
 Schema layout:
-    /signals    voltage arrays (continuous: one dataset; discontinuous:
+    /signals    sample arrays (continuous: one dataset; discontinuous:
                 one dataset per segment)
     /channels   names, units, sampling rates
     /events     annotation onsets, durations, descriptions
@@ -18,10 +18,11 @@ Continuous signals are streamed from the MNE Raw object in fixed-size
 chunks so the full recording is never held in memory at once.
 """
 
-import h5py
-import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+
+import h5py
+import numpy as np
 
 
 # Written to the root attrs of every file, and checked when one is
@@ -38,8 +39,15 @@ from typing import Dict, List, Optional, Any
 # so treat it as a migration rather than a version bump.
 SCHEMA_VERSION = "1.0"
 
-# Signals are written this many seconds at a time. At 500 Hz with
-# 30 channels this is ~3.4 MB per chunk.
+# Signals are written this many seconds at a time, which bounds how much
+# is held in memory while writing. At 500 Hz with 30 channels that is
+# about 3.6 MB per batch.
+#
+# The same figure is used as the HDF5 chunk shape, so it also sets read
+# granularity: reading any part of a chunk decompresses all of it. The
+# two concerns want different sizes — larger is fine for write batching,
+# smaller is better for random reads — so this is worth measuring against
+# real access patterns rather than assuming one number suits both.
 _CHUNK_DURATION_SEC = 60.0
 
 _COMPRESSION = "gzip"
@@ -71,7 +79,8 @@ def write_hdf5(
     channel_names : list of str
         Ordered channel labels.
     channel_units : list of str
-        Physical unit for each channel (e.g., 'uV').
+        Unit of the stored samples for each channel. Currently 'V' for
+        everything the readers produce, since MNE hands back volts.
     sampling_rates : np.ndarray
         Sampling rate per channel (1D, length n_channels).
     events : dict, optional

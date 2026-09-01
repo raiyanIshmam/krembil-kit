@@ -20,10 +20,11 @@ for the whole recording, so every channel shares a rate by construction.
 The format has no way to express anything else.
 """
 
-import numpy as np
-import mne
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+import mne
+import numpy as np
 
 
 def read_brainvision(file_path: str) -> Dict[str, Any]:

@@ -290,3 +290,47 @@ KNOWN ISSUES AND DEFERRED WORK
    Priority: Medium. Nothing is broken, but this is the difference between
    adding a format being a bounded task and being an exercise in
    archaeology.
+
+8. AN UNRECOGNISED UNIT CODE IS RECORDED AS MICROVOLTS
+   _channel_units and _extract_channel_units both end with:
+
+       else:
+           units.append("uV")
+
+   That branch does not run today, since MNE reports volts for every
+   channel of every format we read. But it cannot simply be deleted: with
+   no fallback the returned list would be shorter than the channel count,
+   which breaks the rule that names, units, rates and signal rows are all
+   the same length and in the same order.
+
+   So the fallback has to exist, and "uV" is a fabricated answer — it
+   claims a unit rather than admitting none was recognised. Fixing it
+   means deciding how the schema represents an unknown unit, which is
+   part of item 4 rather than separate from it.
+
+   Priority: Low, and inseparable from item 4.
+
+9. AN ANNOTATIONS-ONLY EDF+D FILE WOULD RAISE TypeError
+   EDF+ permits a file with no ordinary signals at all, where the
+   annotation channel carries everything and the first TAL of each record
+   names the event defining that record's start time (EDF+
+   specification, section 2.2.4).
+
+   Such a file has no ordinary channels, so channel_samples_per_record is
+   None, and _segment_boundaries would evaluate
+
+       segment_start_record * None
+
+   raising TypeError rather than anything informative.
+
+   This was noticed while making _segment_boundaries use the header's
+   exact sample count, and deliberately not guarded at the time: adding a
+   branch for a case with no test file and no known instance is the kind
+   of defensive code that obscures the normal path. Recording it instead.
+
+   Unverified: MNE may well fail on such a file before our code is
+   reached, since raw.ch_names would be empty. Nobody has checked, so it
+   should not be assumed.
+
+   Priority: Low. Legal per the specification, degenerate in practice,
+   and it fails loudly rather than producing wrong output.

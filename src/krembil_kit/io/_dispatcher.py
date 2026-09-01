@@ -53,15 +53,12 @@ from ._readers_brainvision import read_brainvision
 from ._schema import write_hdf5
 
 
-# Maps file extensions to reader functions.
-# EDF requires sub-dispatch based on header content.
 _EXTENSION_MAP = {
     ".vhdr": read_brainvision,
     ".eeg": read_brainvision,
     ".vmrk": read_brainvision,
 }
 
-# EDF subtypes resolved dynamically
 _EDF_READERS = {
     "edf": read_edf,
     "edf+c": read_edf_plus_c,
@@ -76,8 +73,8 @@ def ingest(
     """
     Universal ingestion entry point.
 
-    Accepts a raw recording file, detects its format, extracts all
-    data losslessly, and writes a Version 1.0 HDF5 file.
+    Accepts a raw recording file, works out its format, extracts the data
+    without altering it, and writes a standardized HDF5 file.
 
     Parameters
     ----------
@@ -92,7 +89,9 @@ def ingest(
     Returns
     -------
     Path
-        Absolute path to the generated HDF5 file.
+        Path to the written HDF5 file. Absolute when output_path was not
+        given, since it is derived from the resolved source path.
+        Otherwise exactly the path that was passed in.
 
     Raises
     ------

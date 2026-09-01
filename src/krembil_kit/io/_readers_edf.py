@@ -71,11 +71,12 @@ Spec: https://www.edfplus.info/specs/edfplus.html
       Kemp & Olivan, Clinical Neurophysiology 114 (2003) 1755-1761
 """
 
-import numpy as np
-import mne
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, NamedTuple, Optional, Tuple
+
+import mne
+import numpy as np
 
 
 # A file opens with the fixed header, then one header block per signal.
@@ -292,8 +293,8 @@ def _read_header(file_path: str) -> EdfHeader:
     """
     with open(file_path, "rb") as fh:
         # 236, 244 and 252 are adjacent, and 252 + 4 lands exactly on
-        # 256 where the label block begins, so a single seek covers all
-        # four reads below.
+        # 256 where the label block begins, so one seek reaches
+        # everything from the record count through the labels.
         fh.seek(236)
         n_records = int(fh.read(8).decode("ascii").strip())
         record_duration = float(fh.read(8).decode("ascii").strip())
@@ -627,8 +628,8 @@ def _sampling_rates(raw) -> np.ndarray:
     _reject_mixed_sampling_rates has already refused any file whose
     channels disagree.
     """
-    n = len(raw.ch_names)
-    return np.full(n, raw.info["sfreq"], dtype=np.float64)
+    n_channels = len(raw.ch_names)
+    return np.full(n_channels, raw.info["sfreq"], dtype=np.float64)
 
 
 def _build_metadata(raw, source_format: str, file_path: str) -> Dict[str, Any]:

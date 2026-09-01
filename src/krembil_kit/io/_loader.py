@@ -1,9 +1,13 @@
 """
-HDF5 Loader — Version-Aware Data Access
-=========================================
+HDF5 Loader
+===========
 
-Provides lazy, memory-safe access to HDF5 files produced by ingest().
-Signal data is read from disk only when explicitly requested.
+Lazy access to HDF5 files produced by ingest(). Channel information,
+events and metadata are read when the file is opened; sample data is read
+only when asked for, and only the range asked for.
+
+Nothing here caps how much you can read at once — get_signals() with no
+arguments returns the whole recording, warning first if that is large.
 
 Usage:
     >>> from krembil_kit.io import load
@@ -18,10 +22,11 @@ deterministic.
 """
 
 import warnings
-import h5py
-import numpy as np
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+import h5py
+import numpy as np
 
 from ._schema import SCHEMA_VERSION
 
@@ -224,11 +229,12 @@ class Recording:
         Parameters
         ----------
         start : int, optional
-            First sample index. Defaults to 0.
+            First sample to read. Defaults to 0.
         stop : int, optional
-            Last sample index (exclusive). Defaults to end of file.
+            One past the last sample to read, as with a Python slice.
+            Defaults to the end of the recording.
         channels : list of str, optional
-            Channel names to load. Defaults to all channels.
+            Channel names to read. Defaults to all of them.
 
         Returns
         -------
@@ -241,14 +247,16 @@ class Recording:
                 "Use get_segment() instead."
             )
 
-        ds = self._file["signals"]["data"]
+        dataset = self._file["signals"]["data"]
 
         if start is None:
             start = 0
         if stop is None:
-            stop = ds.shape[1]
+            stop = dataset.shape[1]
 
-        n_channels_read = ds.shape[0] if channels is None else len(channels)
+        n_channels_read = (
+            dataset.shape[0] if channels is None else len(channels)
+        )
         n_requested = (stop - start) * n_channels_read
         if n_requested > _LARGE_FILE_SAMPLES:
             megabytes = n_requested * 4 / 1e6  # signals are stored float32
@@ -259,9 +267,9 @@ class Recording:
             )
 
         if channels is not None:
-            return ds[self._channel_indices(channels), start:stop]
+            return dataset[self._channel_indices(channels), start:stop]
 
-        return ds[:, start:stop]
+        return dataset[:, start:stop]
 
     def get_segment(
         self,
@@ -295,12 +303,12 @@ class Recording:
                 f"(file has {self._n_segments} segments)."
             )
 
-        ds = self._file["signals"][f"segment_{index}"]
+        dataset = self._file["signals"][f"segment_{index}"]
 
         if channels is not None:
-            return ds[self._channel_indices(channels), :]
+            return dataset[self._channel_indices(channels), :]
 
-        return ds[:]
+        return dataset[:]
 
     # ────────────────────────────────────────────────────────────────
     # Lifecycle
