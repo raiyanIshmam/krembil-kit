@@ -81,6 +81,24 @@ STANDARD TO HOLD THE REST OF THIS WORK TO
           # Width of every signal-header field preceding samples-per-record.
           _SAMPLES_FIELD_OFFSET = 16 + 80 + 8 + 8 + 8 + 8 + 8 + 80   # 216
 
+  4a. No references to project files from inside source.
+
+      Docstrings and comments must not say "see known_issues.txt" or
+      "known_issues.txt item 4". The module has to read as a standalone,
+      professional file to someone who only has the source — those files
+      are our tracking artifacts, not part of the code's documentation,
+      and one of them is going to be deleted.
+
+      State the limitation as a fact about the code and stop there:
+
+        BAD   ...which is wrong for any channel that is not a voltage.
+              See known_issues.txt item 4.
+
+        GOOD  ...which is wrong for any channel that is not a voltage.
+
+      The reader learns what the code does and does not do, which is all
+      a docstring owes them. We already know where the issue is tracked.
+
   5. Comments carry WHY, never WHAT.
      "Every data record has identical layout, so a record's position can
      be computed rather than tracked" states a fact about EDF that
@@ -1266,10 +1284,87 @@ STATUS
                  annotation, which claimed Dict on a function that can
                  return None.
 
+  Step 5  DONE. Naming, constants and docstrings.
+
+          Constants, following principle 5a — name what hides a concept,
+          leave what is just a width:
+            _FIXED_HEADER_BYTES / _SIGNAL_HEADER_BYTES, so the line
+              header_size = 256 + 256 * n_signals stops using one number
+              for two different things
+            _BYTES_PER_SAMPLE
+            _SAMPLES_FIELD_OFFSET, written as its own sum so it checks
+              against the field table without adding up
+            _FIFF_UNIT_V / _FIFF_UNIT_T, marked as MNE's codes not EDF's
+          Field widths (8, 4, 16, 44) deliberately left bare.
+
+          Renames:
+            tal_onsets -> record_onsets across three functions. The old
+              name said where the values came from but not that an index
+              into the list is a record number, which is half of what the
+              list is for.
+            _uniform_rates -> _sampling_rates, and its docstring now
+              states the precondition that was invisible: the values are
+              all equal only because the guard refused anything else.
+            annot_ -> annotation_ throughout, resolving the abbreviation
+              inconsistency with the already-spelled-out
+              annotation_indices.
+
+          Docstrings, split by what a reader needs when:
+            module          vocabulary, file layout, MNE-vs-us division
+            _read_header    the field tables and offsets
+            _parse_tals     TAL byte format and the delimiters. Uses r"""
+                            so \x15 stays literal text rather than being
+                            interpreted as an escape.
+            _segment_boundaries  the two timelines
+            Segment, EdfHeader   what their fields mean
+          Nothing stated twice, each piece next to the code it explains.
+
+          Review of the finished file found six things, one a factual
+          error:
+            read_edf_plus_d claimed memory was bounded by the largest
+              segment. It is bounded by the whole recording, since every
+              segment is accumulated before any is written. A docstring
+              promising something we had already documented as untrue.
+            Segment was still unpacked positionally with the pre-rename
+              names, discarding the point of the NamedTuple. Now uses
+              segment.start_sample, and the array list became
+              segment_data so a location and its contents no longer have
+              near-identical names.
+            detect_edf_subtype used `in` rather than startswith.
+            _channel_units had bare 107 / 201.
+            _parse_tals comments duplicated the new docstring.
+            _build_metadata had redundant .get(key, None).
+
+          Also removed every "see known_issues.txt" reference from source.
+          See principle 4a — the module must read standalone to someone
+          who only has the code, and one of those files gets deleted.
+
+          The half-done item 6 from Step 4 was found during the same
+          review: _events_dict existed and read_edf_plus_d used it, but
+          _annotations_to_events still built the dict inline. The
+          str_replace had reported success while matching only the first
+          line of what it was meant to replace, and the tests passed
+          either way because duplicated-but-correct is still correct. It
+          surfaced only from grepping for `annot` to check a rename was
+          safe. Reading the finished file is not optional.
+
+
   ALL OF STEP 4 DONE. _read_header is now the only function in the file
   that knows a byte offset, which was the entire point. Both
   _reject_mixed_sampling_rates and _segment_boundaries became pure
   functions of header facts, with no file I/O and no MNE dependency.
+
+  Confirmed on real data at the end of Step 4:
+      pytest -k "Synthetic or Errors or RealEDF"
+      35 passed, 2 skipped, 5 deselected in 1359.00s
+
+  Fourth consecutive run matching the Step 0 baseline exactly. This one
+  was the important one, because 4.5 changed how samples_per_record is
+  obtained — from int(record_duration * sfreq) to the header's integer.
+  The synthetic EDF+D fixture has 5 records and 3 segments; the real
+  file has 16,246 records and 7 segments checked against
+  reference_segments produced by edfplusdcnv. Only the real test could
+  show the arithmetic still lands in the same place.
 
   Found during Step 0, unrelated to cleanup:
     sub1.edf and sub2.edf are PhysioNet Sleep-EDF recordings with
