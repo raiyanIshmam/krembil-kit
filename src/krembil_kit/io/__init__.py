@@ -2,9 +2,8 @@
 krembil_kit.io — Data Ingestion and Standardization
 ====================================================
 
-Universal translator that reads raw clinical recording files and
-converts them into a standardized Version 1.0 HDF5 format with
-zero preprocessing applied.
+Universal translator that reads raw clinical recording files and converts
+them into a standardized HDF5 format, applying no preprocessing.
 
 Supported formats:
     - EDF   (standard European Data Format)
@@ -15,10 +14,12 @@ Supported formats:
 Usage:
     >>> from krembil_kit.io import ingest, load
     >>> h5_path = ingest("data/Subject01/Subject01.edf")
-    >>> data = load(h5_path)
-    >>> data.channel_names
+    >>> with load(h5_path) as recording:
+    ...     recording.channel_names
+    ...     chunk = recording.get_signals(start=0, stop=5000)
     ['Fp1', 'Fz', 'F3', ...]
-    >>> chunk = data.get_signals(start=0, stop=5000)
+
+SCHEMA_VERSION is the version of the HDF5 layout this release writes.
 """
 
 from ._dispatcher import ingest

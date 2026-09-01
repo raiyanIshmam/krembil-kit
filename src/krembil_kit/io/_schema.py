@@ -1,6 +1,6 @@
 """
-HDF5 Schema Writer — Version 1.0
-=================================
+HDF5 Schema Writer
+==================
 
 Writes extracted recording data into the standardized HDF5 layout.
 All readers funnel their output through write_hdf5() so every file
@@ -24,6 +24,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 
+# Written to the root attrs of every file, and checked when one is
+# opened. Only the major part is compared, so a file stays readable
+# across minor versions.
+#
+# Increment the MINOR part when adding a group, dataset or attribute.
+# Older readers ignore what they do not recognise, and newer ones must
+# cope with the field being absent from older files.
+#
+# Increment the MAJOR part when removing a field, renaming one, or
+# changing the meaning or shape of something that already exists. That
+# is the only change which makes previously converted files unreadable,
+# so treat it as a migration rather than a version bump.
 SCHEMA_VERSION = "1.0"
 
 # Signals are written this many seconds at a time. At 500 Hz with
@@ -46,7 +58,7 @@ def write_hdf5(
     segment_start_times: Optional[List[float]] = None,
 ) -> Path:
     """
-    Write recording data into a Version 1.0 HDF5 file.
+    Write recording data into a standardized HDF5 file.
 
     Parameters
     ----------
@@ -77,6 +89,15 @@ def write_hdf5(
     Path
         Path to the written HDF5 file.
     """
+    n_channels = len(channel_names)
+    if len(channel_units) != n_channels or len(sampling_rates) != n_channels:
+        raise ValueError(
+            f"Channel information does not line up: {n_channels} names, "
+            f"{len(channel_units)} units, {len(sampling_rates)} sampling "
+            f"rates. All three describe the same channels by position, so "
+            f"they must be the same length."
+        )
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -85,9 +106,15 @@ def write_hdf5(
 
         signals_group = h5file.create_group("signals")
         if discontinuous:
-            _write_discontinuous_signals(signals_group, signals, segment_start_times)
+            _write_discontinuous_signals(
+                signals_group, signals, segment_start_times
+            )
         else:
-            _write_continuous_signals(signals_group, signals, float(sampling_rates[0]))
+            # One rate describes every channel, because the readers refuse
+            # recordings whose channels disagree.
+            _write_continuous_signals(
+                signals_group, signals, float(sampling_rates[0])
+            )
 
         _write_channels(h5file, channel_names, channel_units, sampling_rates)
         _write_events(h5file, events)
@@ -119,7 +146,8 @@ def _write_continuous_signals(group, raw, sfreq):
     start = 0
     while start < n_samples:
         stop = min(start + chunk_samples, n_samples)
-        dataset[:, start:stop] = raw.get_data(start=start, stop=stop).astype(np.float32)
+        chunk = raw.get_data(start=start, stop=stop)
+        dataset[:, start:stop] = chunk.astype(np.float32)
         start = stop
 
     group.attrs["discontinuous"] = False
@@ -135,7 +163,8 @@ def _write_discontinuous_signals(group, segments, segment_start_times):
             "segment_start_times is required for discontinuous recordings."
         )
 
-    for idx, (segment, start_time) in enumerate(zip(segments, segment_start_times)):
+    paired = zip(segments, segment_start_times)
+    for idx, (segment, start_time) in enumerate(paired):
         dataset = group.create_dataset(
             f"segment_{idx}",
             data=np.asarray(segment, dtype=np.float32),
@@ -151,6 +180,13 @@ def _write_discontinuous_signals(group, segments, segment_start_times):
 # ── Metadata writers ────────────────────────────────────────────────
 
 def _write_channels(h5file, channel_names, channel_units, sampling_rates):
+    """
+    Write the three parallel channel datasets.
+
+    They are parallel by contract: entry i of each describes the same
+    channel as row i of the signal data. A channel is identified by its
+    position, not by its label.
+    """
     group = h5file.create_group("channels")
     group.create_dataset(
         "names", data=np.array(channel_names, dtype=h5py.string_dtype())
@@ -164,6 +200,12 @@ def _write_channels(h5file, channel_names, channel_units, sampling_rates):
 
 
 def _write_events(h5file, events):
+    """
+    Write the event datasets, using empty ones when there are no events.
+
+    The group and all three datasets are always created, so nothing
+    downstream has to check whether /events exists before reading it.
+    """
     group = h5file.create_group("events")
     if events is None:
         events = {"onsets": [], "durations": [], "descriptions": []}
@@ -181,6 +223,13 @@ def _write_events(h5file, events):
 
 
 def _write_metadata(h5file, metadata):
+    """
+    Write recording information as attributes on /metadata.
+
+    Values are stored as strings, and a key is written only when the
+    source recording supplied a value — so which attributes are present
+    varies between files and readers should not assume any given one.
+    """
     group = h5file.create_group("metadata")
     if metadata is None:
         return

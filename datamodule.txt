@@ -91,6 +91,30 @@ requires a second storage mode rather than a modification of this one,
 and downstream code will have to handle or refuse that mode explicitly,
 exactly as it already must for discontinuous recordings.
 
+6. SCHEMA VERSIONING RULE
+The point of converting recordings is that the converted files outlive
+the code that wrote them. A file converted today must still open years
+from now, which places a constraint on how the schema may change.
+
+The loader compares only the major part of the version. A file written
+under schema 1.0 therefore opens under a 1.1 loader, and vice versa.
+
+This is only safe if minor versions are additive. The rule:
+
+- A minor increment may ADD a group, dataset or attribute. An older
+  loader ignores what it does not recognise, and a newer loader must
+  cope with the field being absent from older files.
+- Anything that REMOVES a field, renames one, or changes the meaning or
+  shape of an existing one requires a major increment. That is the only
+  circumstance under which previously converted files stop being
+  readable, and it should be treated as a migration rather than a
+  version bump.
+
+Matching versions exactly would be simpler to implement and much worse
+in practice: every schema change, however small, would orphan every file
+already converted, and the archive would only be readable by pinning the
+release that wrote it.
+
 
 FUTURE INTEGRATION STRATEGY: SPIKE2 (.SMR / .SMRX) DATA
 

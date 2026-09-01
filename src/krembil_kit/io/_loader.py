@@ -7,14 +7,14 @@ Signal data is read from disk only when explicitly requested.
 
 Usage:
     >>> from krembil_kit.io import load
-    >>> data = load("recording.h5")
-    >>> data.channel_names
+    >>> with load("recording.h5") as recording:
+    ...     recording.channel_names
+    ...     chunk = recording.get_signals(start=0, stop=5000)
     ['Fp1', 'Fz', 'F3', ...]
-    >>> data.sampling_rate
-    500.0
-    >>> chunk = data.get_signals(start=0, stop=5000)
-    >>> chunk.shape
-    (43, 5000)
+
+The `with` form closes the file when the block exits. Without it the file
+is closed once the Recording is garbage collected, which works but is not
+deterministic.
 """
 
 import warnings
@@ -25,7 +25,38 @@ from typing import List, Optional, Dict, Any
 
 from ._schema import SCHEMA_VERSION
 
-_LARGE_FILE_SAMPLES = 50_000_000  # ~100s at 500Hz × 100ch
+# Reads larger than this warn about memory. 50 million float32 samples is
+# 200 MB, roughly 17 minutes of 100 channels at 500 Hz.
+_LARGE_FILE_SAMPLES = 50_000_000
+
+
+def _major_version(version) -> int:
+    """
+    The major part of a schema version like "1.0".
+
+    Only the major part is compared when opening a file. Minor versions
+    are additive by rule, so a newer file may carry fields an older loader
+    does not know about and can ignore. Anything that removes or reshapes
+    what already exists increments the major instead, and that is the only
+    case where an old file becomes unreadable.
+    """
+    text = str(version)
+    major = text.split(".")[0]
+    if not major.isdigit():
+        raise ValueError(
+            f"Schema version {text!r} is not a version number like '1.0'."
+        )
+    return int(major)
+
+
+def _as_str(values) -> List[str]:
+    """
+    Decode a dataset of strings.
+
+    h5py returns byte strings or str depending on how they were written
+    and on the h5py version, so both are handled.
+    """
+    return [v.decode() if isinstance(v, bytes) else v for v in values]
 
 
 class Recording:
@@ -46,64 +77,55 @@ class Recording:
         self._load_metadata()
 
     def _validate_version(self):
-        version = self._file.attrs.get("schema_version", None)
+        version = self._file.attrs.get("schema_version")
         if version is None:
             raise ValueError(
-                f"Not a valid krembil-kit HDF5 file: "
-                f"missing schema_version attribute."
+                f"{self._path.name} is not a krembil-kit file: it has no "
+                f"schema_version attribute."
             )
-        if version != SCHEMA_VERSION:
+
+        if _major_version(version) != _major_version(SCHEMA_VERSION):
             raise ValueError(
-                f"Unsupported schema version '{version}'. "
-                f"This loader supports version '{SCHEMA_VERSION}'."
+                f"{self._path.name} uses schema version {version}, and this "
+                f"loader reads version {SCHEMA_VERSION}. The major versions "
+                f"differ, so the layout is not compatible."
             )
 
     def _load_metadata(self):
-        f = self._file
+        h5file = self._file
 
-        # Channel info
-        self._channel_names = [
-            n.decode() if isinstance(n, bytes) else n
-            for n in f["channels"]["names"][:]
-        ]
-        self._sampling_rates = f["channels"]["sampling_rates"][:]
-        self._channel_units = [
-            u.decode() if isinstance(u, bytes) else u
-            for u in f["channels"]["units"][:]
-        ]
+        self._channel_names = _as_str(h5file["channels"]["names"][:])
+        self._channel_units = _as_str(h5file["channels"]["units"][:])
+        self._sampling_rates = h5file["channels"]["sampling_rates"][:]
 
-        # Discontinuous flag
-        self._discontinuous = bool(
-            f["signals"].attrs.get("discontinuous", False)
-        )
+        signals = h5file["signals"]
+        self._discontinuous = bool(signals.attrs.get("discontinuous", False))
 
-        # Signal shape
         if self._discontinuous:
-            self._n_segments = int(f["signals"].attrs["n_segments"])
-            self._n_samples = None
+            self._n_segments = int(signals.attrs["n_segments"])
+            segments = [
+                signals[f"segment_{i}"] for i in range(self._n_segments)
+            ]
+            self._n_samples = sum(seg.shape[1] for seg in segments)
+            self._segment_start_times = [
+                float(seg.attrs["start_time_seconds"]) for seg in segments
+            ]
         else:
             self._n_segments = None
-            self._n_samples = f["signals"]["data"].shape[1]
+            self._n_samples = signals["data"].shape[1]
+            self._segment_start_times = None
 
-        # Events
-        onsets = f["events"]["onsets"][:]
+        onsets = h5file["events"]["onsets"][:]
         if len(onsets) > 0:
-            descriptions = [
-                d.decode() if isinstance(d, bytes) else d
-                for d in f["events"]["descriptions"][:]
-            ]
-            durations = f["events"]["durations"][:]
             self._events = {
                 "onsets": list(onsets),
-                "durations": list(durations),
-                "descriptions": descriptions,
+                "durations": list(h5file["events"]["durations"][:]),
+                "descriptions": _as_str(h5file["events"]["descriptions"][:]),
             }
         else:
             self._events = None
 
-        # Metadata attributes
-        meta_grp = f["metadata"]
-        self._metadata = dict(meta_grp.attrs)
+        self._metadata = dict(h5file["metadata"].attrs)
 
     # ────────────────────────────────────────────────────────────────
     # Properties (instant, no disk I/O)
@@ -119,6 +141,12 @@ class Recording:
 
     @property
     def sampling_rate(self) -> float:
+        """
+        The sampling rate shared by every channel.
+
+        Ingest refuses recordings whose channels disagree, so a single
+        value describes all of them.
+        """
         return float(self._sampling_rates[0])
 
     @property
@@ -130,8 +158,13 @@ class Recording:
         return self._discontinuous
 
     @property
-    def n_samples(self) -> Optional[int]:
-        """Total samples for continuous files. None if discontinuous."""
+    def n_samples(self) -> int:
+        """
+        Total samples in the recording.
+
+        For a discontinuous recording this is the sum across segments, so
+        it counts samples that were recorded and does not include gaps.
+        """
         return self._n_samples
 
     @property
@@ -140,11 +173,15 @@ class Recording:
         return self._n_segments
 
     @property
-    def duration_seconds(self) -> Optional[float]:
-        """Recording duration in seconds. None if discontinuous."""
-        if self._n_samples is not None:
-            return self._n_samples / self.sampling_rate
-        return None
+    def duration_seconds(self) -> float:
+        """
+        Total recorded time in seconds.
+
+        Gaps are not counted, so for a discontinuous recording this is
+        shorter than the span from the first segment to the last. Use
+        segment_start_times if you need that span.
+        """
+        return self._n_samples / self.sampling_rate
 
     @property
     def events(self) -> Optional[Dict[str, Any]]:
@@ -157,17 +194,23 @@ class Recording:
     @property
     def segment_start_times(self) -> Optional[List[float]]:
         """Absolute start time of each segment. None if continuous."""
-        if not self._discontinuous:
-            return None
-        times = []
-        for i in range(self._n_segments):
-            t = self._file["signals"][f"segment_{i}"].attrs["start_time_seconds"]
-            times.append(float(t))
-        return times
+        return self._segment_start_times
 
     # ────────────────────────────────────────────────────────────────
     # Signal access (reads from disk)
     # ────────────────────────────────────────────────────────────────
+
+    def _channel_indices(self, channels: List[str]) -> List[int]:
+        """
+        Positions of the named channels, in the order they were asked for.
+        """
+        missing = [ch for ch in channels if ch not in self._channel_names]
+        if missing:
+            raise ValueError(
+                f"{self._path.name} does not have these channels: {missing}. "
+                f"Use .channel_names to see the {self.n_channels} it has."
+            )
+        return [self._channel_names.index(ch) for ch in channels]
 
     def get_signals(
         self,
@@ -205,19 +248,18 @@ class Recording:
         if stop is None:
             stop = ds.shape[1]
 
-        # Warn on large full-file loads
-        n_requested = (stop - start) * ds.shape[0]
-        if start == 0 and stop == ds.shape[1] and n_requested > _LARGE_FILE_SAMPLES:
-            mb = n_requested * 4 / 1e6
+        n_channels_read = ds.shape[0] if channels is None else len(channels)
+        n_requested = (stop - start) * n_channels_read
+        if n_requested > _LARGE_FILE_SAMPLES:
+            megabytes = n_requested * 4 / 1e6  # signals are stored float32
             warnings.warn(
-                f"Loading full file into memory ({mb:.0f} MB). "
-                f"Consider using start/stop to load a subset.",
+                f"This read is about {megabytes:.0f} MB. Pass start and stop "
+                f"to read a smaller window.",
                 stacklevel=2,
             )
 
         if channels is not None:
-            indices = [self._channel_names.index(ch) for ch in channels]
-            return ds[indices, start:stop]
+            return ds[self._channel_indices(channels), start:stop]
 
         return ds[:, start:stop]
 
@@ -256,8 +298,7 @@ class Recording:
         ds = self._file["signals"][f"segment_{index}"]
 
         if channels is not None:
-            indices = [self._channel_names.index(ch) for ch in channels]
-            return ds[indices, :]
+            return ds[self._channel_indices(channels), :]
 
         return ds[:]
 
@@ -279,10 +320,11 @@ class Recording:
         if self._discontinuous:
             info = f"{self._n_segments} segments"
         else:
-            info = f"{self._n_samples} samples ({self.duration_seconds:.1f}s)"
+            info = f"{self._n_samples} samples"
         return (
             f"Recording({self._path.name}: "
-            f"{self.n_channels}ch @ {self.sampling_rate}Hz, {info})"
+            f"{self.n_channels}ch @ {self.sampling_rate}Hz, "
+            f"{info}, {self.duration_seconds:.1f}s)"
         )
 
 

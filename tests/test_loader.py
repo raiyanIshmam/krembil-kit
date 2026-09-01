@@ -120,8 +120,14 @@ class TestLoaderSyntheticDiscontinuous:
         assert data.sampling_rate == sfreq
         assert data.discontinuous is True
         assert data.n_segments == len(segments)
-        assert data.n_samples is None
-        assert data.duration_seconds is None
+
+        # Recorded samples only. The fixture spans 11 s of wall clock but
+        # holds 5 s of data, so this would fail if duration ever became
+        # the span instead.
+        recorded_samples = sum(seg.shape[1] for seg in segments)
+        assert data.n_samples == recorded_samples
+        assert abs(data.duration_seconds - recorded_samples / sfreq) < 1e-9
+
         data.close()
 
     def test_segment_start_times(self, tmp_path):
@@ -184,18 +190,33 @@ class TestLoaderErrors:
         with pytest.raises(FileNotFoundError):
             load("nonexistent.h5")
 
-    def test_invalid_schema(self, tmp_path):
+    def test_major_version_mismatch_is_refused(self, tmp_path):
         bad_h5 = str(tmp_path / "bad.h5")
         with h5py.File(bad_h5, "w") as f:
             f.attrs["schema_version"] = "99.0"
-        with pytest.raises(ValueError, match="Unsupported schema version"):
+        with pytest.raises(ValueError, match="schema version 99.0"):
             load(bad_h5)
+
+    def test_minor_version_still_loads(self, tmp_path):
+        """
+        Minor schema changes are additive by rule, so a file written under
+        a different minor version must still open.
+        """
+        path, _, _, _ = create_synthetic_edf()
+        h5 = str(tmp_path / "out.h5")
+        ingest(path, output_path=h5)
+
+        with h5py.File(h5, "r+") as f:
+            f.attrs["schema_version"] = "1.99"
+
+        with load(h5) as recording:
+            assert recording.n_channels > 0
 
     def test_missing_schema(self, tmp_path):
         bad_h5 = str(tmp_path / "bad.h5")
         with h5py.File(bad_h5, "w") as f:
             f.create_group("signals")
-        with pytest.raises(ValueError, match="missing schema_version"):
+        with pytest.raises(ValueError, match="no schema_version"):
             load(bad_h5)
 
     def test_get_signals_on_discontinuous(self, tmp_path):

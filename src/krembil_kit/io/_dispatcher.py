@@ -2,13 +2,42 @@
 Central Dispatcher — Format Routing
 ====================================
 
-The sole entry point for data ingestion. Inspects the incoming file
-extension, delegates to the appropriate isolated reader, and writes
-the result to a standardized Version 1.0 HDF5 file.
+The sole entry point for data ingestion. Looks at the file extension,
+hands the file to the reader for that format, and writes the result to a
+standardized HDF5 file.
 
-Adding support for a new format requires:
-    1. Writing an isolated reader function.
-    2. Registering it in the _EXTENSION_MAP below.
+
+ADDING A FORMAT
+
+    1. Write a reader that takes a file path and returns the dictionary
+       described below.
+    2. Register it in _EXTENSION_MAP.
+
+Nothing else changes. The schema writer, the loader, and everything
+downstream work from that dictionary alone, which is why readers do not
+need to know about each other.
+
+
+WHAT A READER MUST RETURN
+
+    signals              an MNE Raw object for a continuous recording,
+                         or a list of arrays, one per segment, if
+                         discontinuous
+    channel_names        list of str, one per channel
+    channel_units        list of str, one per channel
+    sampling_rates       numpy array, one rate per channel
+    events               dict holding onsets, durations and descriptions,
+                         each a list of equal length; or None when the
+                         recording has no events
+    metadata             dict, written as HDF5 attributes
+    discontinuous        bool, saying which of the two signal layouts
+                         above is being returned
+    segment_start_times  list of wall-clock start times, one per segment;
+                         None when continuous
+
+Everything describing channels — names, units, sampling rates, and the
+rows of the signal array — must be the same length and in the same order.
+A channel is identified by its position, not by its label.
 """
 
 from pathlib import Path
@@ -67,10 +96,12 @@ def ingest(
 
     Raises
     ------
-    ValueError
-        If the file extension is not supported.
     FileNotFoundError
         If the source file does not exist.
+    ValueError
+        If the extension is not supported, or if the reader refuses the
+        file — for example an EDF recording whose channels do not share a
+        sampling rate.
 
     Examples
     --------
@@ -89,29 +120,24 @@ def ingest(
 
     extension = source.suffix.lower()
 
-    # ── Route to appropriate reader ─────────────────────────────
+    # EDF needs a second lookup. The extension does not say whether the
+    # file is plain EDF, EDF+C or EDF+D — that is in the header.
     if extension == ".edf":
-        subtype = detect_edf_subtype(str(source))
-        reader = _EDF_READERS[subtype]
+        reader = _EDF_READERS[detect_edf_subtype(str(source))]
     elif extension in _EXTENSION_MAP:
         reader = _EXTENSION_MAP[extension]
     else:
-        supported = sorted(
-            set(list(_EXTENSION_MAP.keys()) + [".edf"])
-        )
+        supported = sorted({*_EXTENSION_MAP, ".edf"})
         raise ValueError(
-            f"Unsupported file format: '{extension}'. "
-            f"Supported extensions: {supported}"
+            f"Cannot read '{extension}' files. Supported extensions: "
+            f"{supported}"
         )
 
-    # ── Execute reader ──────────────────────────────────────────
     data = reader(str(source))
 
-    # ── Determine output path ───────────────────────────────────
     if output_path is None:
         output_path = str(source.with_suffix(".h5"))
 
-    # ── Write to HDF5 ──────────────────────────────────────────
     result_path = write_hdf5(
         output_path=output_path,
         signals=data["signals"],

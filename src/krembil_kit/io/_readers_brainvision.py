@@ -1,90 +1,75 @@
 """
-BrainVision (.vhdr / .eeg / .vmrk) Isolated Reader
-====================================================
+BrainVision (.vhdr / .eeg / .vmrk) Reader
+=========================================
 
-Reads BrainVision format recordings (three associated files):
-    - .vhdr  — Header file (channel info, sampling rate, format)
-    - .eeg   — Raw binary data
-    - .vmrk  — Marker file (event annotations)
+A BrainVision recording is three files:
 
-MNE-Python handles the tri-file relationship automatically when
-given the .vhdr path. This reader also accepts a .eeg path and
-resolves the .vhdr sibling.
+    .vhdr    header — channel names, sampling rate, data format
+    .eeg     the raw binary samples
+    .vmrk    markers, which become our events
 
-Zero preprocessing is applied. Data is extracted as-is.
+MNE handles the relationship between them when given the .vhdr, and this
+reader accepts any of the three extensions and resolves to it.
 
-Memory-safe: The Raw object is passed with preload=False so the
-schema writer can stream data in chunks.
+No preprocessing is applied. The Raw object is passed on with
+preload=False so the schema writer can stream it to disk in chunks.
+
+Unlike the EDF reader there is no mixed sampling rate guard here, and
+that is deliberate. The .vhdr header declares a single SamplingInterval
+for the whole recording, so every channel shares a rate by construction.
+The format has no way to express anything else.
 """
 
 import numpy as np
 import mne
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 
 def read_brainvision(file_path: str) -> Dict[str, Any]:
     """
-    Read a BrainVision recording and return standardized dictionary
+    Read a BrainVision recording and return the standardized dictionary
     for the schema writer.
 
-    The Raw object is passed with preload=False for memory-safe
-    streaming during HDF5 write.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to the .vhdr header file, or the .eeg data file.
-        If .eeg is provided, the reader resolves the matching .vhdr.
-
-    Returns
-    -------
-    dict
-        Standardized data dictionary ready for write_hdf5().
+    Accepts the path to any of the three files — .vhdr, .eeg or .vmrk —
+    and resolves to the .vhdr, which is the one MNE needs.
 
     Raises
     ------
+    ValueError
+        If the path carries none of the three extensions.
     FileNotFoundError
-        If the .vhdr file cannot be located.
+        If the .vhdr sibling does not exist.
     """
-    file_path = Path(file_path).resolve()
-
-    # Resolve to .vhdr if user passed .eeg or .vmrk
-    vhdr_path = _resolve_vhdr(file_path)
+    vhdr_path = _resolve_vhdr(Path(file_path).resolve())
 
     raw = mne.io.read_raw_brainvision(
         str(vhdr_path), preload=False, verbose=False
     )
 
     channel_names = raw.ch_names
-    sfreq = raw.info["sfreq"]
-    n_channels = len(channel_names)
-
-    # Channel units — BrainVision typically records in µV
     channel_units = _extract_channel_units(raw)
-    sampling_rates = np.full(n_channels, sfreq, dtype=np.float64)
+    sampling_rates = np.full(
+        len(channel_names), raw.info["sfreq"], dtype=np.float64
+    )
 
-    # Extract markers from .vmrk as events
+    # MNE turns the .vmrk markers into annotations.
     events = _extract_annotations(raw)
 
-    # Metadata
     meas_date = raw.info.get("meas_date")
-    start_datetime = (
-        meas_date.isoformat() if meas_date is not None else None
-    )
     subject_info = raw.info.get("subject_info") or {}
-
     device_info = raw.info.get("device_info") or {}
+
     metadata = {
-        "start_datetime": start_datetime,
-        "subject_id": subject_info.get("his_id", None),
-        "equipment": device_info.get("type", None),
+        "start_datetime": meas_date.isoformat() if meas_date else None,
+        "subject_id": subject_info.get("his_id"),
+        "equipment": device_info.get("type"),
         "source_format": "BrainVision",
         "source_file": vhdr_path.name,
     }
 
     return {
-        "signals": raw,  # Raw object, streamed during write
+        "signals": raw,
         "channel_names": channel_names,
         "channel_units": channel_units,
         "sampling_rates": sampling_rates,
@@ -121,8 +106,16 @@ def _resolve_vhdr(file_path: Path) -> Path:
     return vhdr_path
 
 
-def _extract_channel_units(raw) -> list:
-    """Extract physical units from MNE Raw channel info."""
+def _extract_channel_units(raw) -> List[str]:
+    """
+    Map MNE's per-channel unit code to a string.
+
+    107 and 201 are MNE's own FIFF codes for volts and tesla. In practice
+    MNE reports volts for every BrainVision channel, so this returns "V"
+    throughout and the other two branches never run. The .vhdr header
+    states each channel's unit and we ignore it, which is wrong for any
+    channel that is not a voltage.
+    """
     channel_units = []
     for ch_info in raw.info["chs"]:
         unit_code = ch_info.get("unit", 0)
@@ -135,21 +128,17 @@ def _extract_channel_units(raw) -> list:
     return channel_units
 
 
-def _extract_annotations(raw) -> Dict[str, Any]:
+def _extract_annotations(raw) -> Optional[Dict[str, Any]]:
     """
-    Convert MNE annotations (parsed from .vmrk) to the standardized
-    events dictionary. Returns None if no annotations exist.
+    Convert the markers MNE parsed from the .vmrk file into the events
+    dictionary the schema writer expects, or None when there are none.
     """
     annotations = raw.annotations
     if annotations is None or len(annotations) == 0:
         return None
 
-    onsets = list(annotations.onset)
-    durations = list(annotations.duration)
-    descriptions = list(annotations.description)
-
     return {
-        "onsets": onsets,
-        "durations": durations,
-        "descriptions": descriptions,
+        "onsets": list(annotations.onset),
+        "durations": list(annotations.duration),
+        "descriptions": list(annotations.description),
     }
