@@ -1,12 +1,24 @@
+"""
+krembil-kit — EEG recording conversion and analysis.
+
+The ingestion API is available directly from the package:
+
+    >>> from krembil_kit import ingest, load
+    >>> h5_path = ingest("recording.edf")
+    >>> with load(h5_path) as recording:
+    ...     recording.channel_names
+
+The older analysis modules are no longer imported here. Importing them
+pulled in matplotlib, torch and opencv for anyone who only wanted to
+convert a recording. They remain available directly, for example
+`from krembil_kit.edf_loader import EDFLoader`.
+"""
+
 __version__ = "1.0.7"
 
 import logging
 
-from .edf_loader import EDFLoader
-from .trigger_detector import TriggerDetector
-from .spectral_analyzer import SpectralAnalyzer
-from .connectivity_analyzer import ConnectivityAnalyzer
-from .connectivity_reader import ConnectivityReader
+from .io import Recording, SCHEMA_VERSION, ingest, load
 
 def set_log_level(level='INFO'):
     """
@@ -45,9 +57,10 @@ def set_log_level(level='INFO'):
         # Prevent propagation to root logger to avoid duplicate messages
         logger.propagate = False
 
-__all__ = ["EDFLoader", 
-           "TriggerDetector",
-           "SpectralAnalyzer",
-           "ConnectivityAnalyzer",
-           "ConnectivityReader",
-           "set_log_level"]
+__all__ = [
+    "ingest",
+    "load",
+    "Recording",
+    "SCHEMA_VERSION",
+    "set_log_level",
+]
