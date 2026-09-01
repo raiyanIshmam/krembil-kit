@@ -57,6 +57,7 @@ KNOWN ISSUES AND DEFERRED WORK
    the reader-writer interface for the discontinuous case.
    Priority: Low (current test files work fine; only affects
    multi-GB discontinuous recordings with many segments).
+
 3. TRUNCATED FILES ARE NOT DETECTED
    The EDF header states how many data records the file contains, and
    the signal headers state how large each record is. Together with the
@@ -106,7 +107,7 @@ KNOWN ISSUES AND DEFERRED WORK
 
    Returning a LIST rather than raising on the first fault, so someone
    with 200 files learns everything wrong with each in one pass. This is
-   the inspect() idea from item 6 and it is nearly free now that the
+   the inspect() idea from item 5 and it is nearly free now that the
    header reader exists.
 
    ONE THING THAT MUST NOT BECOME OPTIONAL. There are two kinds of check
@@ -202,27 +203,7 @@ KNOWN ISSUES AND DEFERRED WORK
    once mixed-rate support lands, because that removes the guard and
    makes DegC channels ingestable.
 
-5. SCHEMA VERSION IS MATCHED EXACTLY, WHICH ORPHANS OLD ARCHIVES
-   _loader.py rejects any file whose schema_version is not identical to
-   the loader's own:
-
-       if version != SCHEMA_VERSION:
-           raise ValueError(f"Unsupported schema version '{version}'...")
-
-   So the day SCHEMA_VERSION becomes "1.1", every file converted under
-   "1.0" stops loading unless the user pins an old release. For a tool
-   whose purpose is archival that is backwards — the format should
-   outlive the code that wrote it.
-
-   Normal practice: accept the same major version, reject across major
-   bumps, and have the loader fill in defaults for fields a newer schema
-   added. That means minor versions must only ever be additive, which is
-   worth stating as a rule now while there is only one version.
-
-   Priority: Medium. Costs nothing today because there is one version,
-   but every converted file is a hostage until it is fixed.
-
-6. INGEST IS SILENT DURING A MULTI-MINUTE OPERATION
+5. INGEST IS SILENT DURING A MULTI-MINUTE OPERATION
    ingest() on a large file prints nothing while it works. A 645 MB
    EDF+D takes minutes, and a frozen terminal is indistinguishable from
    a hang. tqdm is already a declared dependency and the chunk loop in
@@ -236,7 +217,7 @@ KNOWN ISSUES AND DEFERRED WORK
    gaps rather than design problems. The inspect() one becomes nearly
    free once the Step 4 header reader exists.
 
-7. THE READER CONTRACT IS NOT WRITTEN DOWN, AND READERS COPY EACH OTHER
+6. THE READER CONTRACT IS NOT WRITTEN DOWN, AND READERS COPY EACH OTHER
    Every reader must return the same eight keys, and the dispatcher
    unpacks exactly those into write_hdf5:
 
@@ -291,7 +272,7 @@ KNOWN ISSUES AND DEFERRED WORK
    adding a format being a bounded task and being an exercise in
    archaeology.
 
-8. AN UNRECOGNISED UNIT CODE IS RECORDED AS MICROVOLTS
+7. AN UNRECOGNISED UNIT CODE IS RECORDED AS MICROVOLTS
    _channel_units and _extract_channel_units both end with:
 
        else:
@@ -310,7 +291,7 @@ KNOWN ISSUES AND DEFERRED WORK
 
    Priority: Low, and inseparable from item 4.
 
-9. AN ANNOTATIONS-ONLY EDF+D FILE WOULD RAISE TypeError
+8. AN ANNOTATIONS-ONLY EDF+D FILE WOULD RAISE TypeError
    EDF+ permits a file with no ordinary signals at all, where the
    annotation channel carries everything and the first TAL of each record
    names the event defining that record's start time (EDF+
