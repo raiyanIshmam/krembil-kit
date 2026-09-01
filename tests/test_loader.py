@@ -41,6 +41,7 @@ class TestLoaderSyntheticContinuous:
             assert recording.n_channels == len(ch_names)
             assert recording.discontinuous is False
             assert recording.n_segments is None
+            assert recording.segment_lengths is None
             assert recording.n_samples == int(5 * sfreq)
             assert recording.duration_seconds == pytest.approx(5.0)
 
@@ -174,9 +175,14 @@ class TestLoaderSyntheticDiscontinuous:
             assert recording.discontinuous is True
             assert recording.n_segments == len(segments)
 
-            # Recorded samples only. The fixture spans 11 s of wall
-            # clock but holds 5 s of data, so this would fail if
-            # duration ever became the span instead.
+            assert recording.segment_lengths == [
+                seg.shape[1] for seg in segments
+            ]
+
+            # Recorded samples only, and the sum of the lengths above.
+            # The fixture spans 11 s of wall clock but holds 5 s of
+            # data, so this would fail if duration ever became the span
+            # instead.
             recorded_samples = sum(seg.shape[1] for seg in segments)
             assert recording.n_samples == recorded_samples
             assert recording.duration_seconds == pytest.approx(

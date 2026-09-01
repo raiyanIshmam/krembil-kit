@@ -111,12 +111,16 @@ class Recording:
             segments = [
                 signals[f"segment_{i}"] for i in range(self._n_segments)
             ]
-            self._n_samples = sum(seg.shape[1] for seg in segments)
+            # Shapes and attributes come from the HDF5 metadata, so
+            # nothing here reads signal data.
+            self._segment_lengths = [seg.shape[1] for seg in segments]
+            self._n_samples = sum(self._segment_lengths)
             self._segment_start_times = [
                 float(seg.attrs["start_time_seconds"]) for seg in segments
             ]
         else:
             self._n_segments = None
+            self._segment_lengths = None
             self._n_samples = signals["data"].shape[1]
             self._segment_start_times = None
 
@@ -200,6 +204,16 @@ class Recording:
     def segment_start_times(self) -> Optional[List[float]]:
         """Absolute start time of each segment. None if continuous."""
         return self._segment_start_times
+
+    @property
+    def segment_lengths(self) -> Optional[List[int]]:
+        """
+        Samples in each segment. None if continuous.
+
+        Taken from the dataset shapes when the file was opened, so
+        asking for this does not read signal data.
+        """
+        return self._segment_lengths
 
     # ────────────────────────────────────────────────────────────────
     # Signal access (reads from disk)
